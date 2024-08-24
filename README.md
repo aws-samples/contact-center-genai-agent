@@ -1,11 +1,6 @@
-## My Project
+# Contact Center GenAI Assistant
 
-TODO: Fill this README out!
-
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
+Stay tuned, coming soon!
 
 ## Security
 
