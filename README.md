@@ -10,7 +10,7 @@
     - [Step 3: Deploy the RAG Solution stack](#step-3-deploy-the-rag-solution-stack)
     - [Step 4: Deploy the Conversation Analytics stack _(optional)_](#step-4-deploy-the-conversation-analytics-stack-optional)
     - [Step 5: Set up the Amazon QuickSight dashboard _(optional)_](#step-5-set-up-the-quicksight-dashboard-optional)
-    - [Step 6: Automated testing _(optional)_](#step-6-automated-testing-optional)
+    - [Step 6: Automated testing notebooks _(optional)_](#step-6-automated-testing-notebooks-optional)
 
 - [Clean up](#clean-up)
 - [Adapt the solution to your use case](#adapt-the-solution-to-your-use-case)
