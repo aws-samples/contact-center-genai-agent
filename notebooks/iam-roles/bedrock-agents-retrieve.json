@@ -1,0 +1,16 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "BedrockAgentsRetrieve",
+            "Effect": "Allow",
+            "Action": [
+                "bedrock:GetKnowledgeBase",
+                "bedrock:Retrieve"
+            ],
+            "Resource": [
+                "arn:aws:bedrock:*:*:knowledge-base/*"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,481 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: >
+  Creates a Lambda function, triggered by an SQS queue, to detect hallucinations in responses from an LLM-based RAG solution.
+
+Parameters:
+  pHallucinationDetectionLLM:
+    Type: String
+    Default: 'Claude V3 Sonnet'
+    AllowedValues:
+      - 'Claude V3 Sonnet'
+      - 'Claude V3.5 Sonnet'
+      - 'Claude V3 Opus'
+      - 'Cohere Command R'
+      - 'Cohere Command R Plus'
+      - 'Titan Text Premier'
+      - 'Llama 3 70B Instruct'
+      - 'Mistral Large'
+    Description: Choose an LLM to use for hallucination detection
+
+  pUseCMK:
+    Type: String
+    Default: 'no'
+    AllowedValues:
+      - 'no'
+      - 'yes'
+    Description: Create a customer-managed KMS key for encrypting CloudWatch Logs log group and the SQS queue
+
+  pCloudWatchErrorAlarms:
+    Type: String
+    Default: 'yes'
+    AllowedValues:
+      - 'no'
+      - 'yes'
+    Description: Create CloudWatch alarms for error conditions in the hallucination detection Lambda function?
+
+  pCloudWatchWarningAlarms:
+    Type: String
+    Default: 'yes'
+    AllowedValues:
+      - 'no'
+      - 'yes'
+    Description: Create CloudWatch alarms for instances where the Lambda functon detects a hallucination
+
+  pErrorAlarmEmailSubscription:
+    Type: String
+    Default: ''
+    Description: Leave blank, or provide a single email address/distribution list to receive CloudWatch error alarm notifications
+
+  pWarningAlarmEmailSubscription:
+    Type: String
+    Default: ''
+    Description: Leave blank, or provide a single email address/distribution list to receive CloudWatch warning alarm notifications
+
+  pS3BlogArtifactsBucket:
+    Type: String
+    Description: Temporary - will not be needed when blog post is published
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: Hallucination Detection LLM
+      Parameters:
+      - pHallucinationDetectionLLM
+      - pUseCMK
+    - Label:
+        default: CloudWatch Alarms
+      Parameters:
+      - pCloudWatchErrorAlarms
+      - pErrorAlarmEmailSubscription
+      - pCloudWatchWarningAlarms
+      - pWarningAlarmEmailSubscription
+    - Label:
+        default: Blog Post Artifacts
+      Parameters:
+      - pS3BlogArtifactsBucket
+    ParameterLabels:
+      pHallucinationDetectionLLM:
+        default: Select an LLM
+      pUseCMK:
+        default: Create a Customer-Managed Key?
+      pCloudWatchErrorAlarms:
+        default: Create CloudWatch ERROR alarms?
+      pErrorAlarmEmailSubscription:
+        default: Subscribe to CloudWatch ERROR alarms?
+      pCloudWatchWarningAlarms:
+        default: Create CloudWatch WARNING alarms?
+      pWarningAlarmEmailSubscription:
+        default: Subscribe to CloudWatch WARNING alarms?
+      pS3BlogArtifactsBucket:
+        default: Name of the S3 bucket with blog artifacts
+
+Mappings:
+  S3Path:
+    DetectionFunctionSource:
+      Name: 'hallucinations/hallucination-detection-function.zip'
+  BucketName:
+    eu-west-1:
+      Name: 'lex-usecases-eu-west-1'
+    ap-northeast-1:
+      Name: 'lex-usecases-ap-northeast-1'
+    ap-southeast-1:
+      Name: 'lex-usecases-ap-southeast-1'
+    ap-southeast-2:
+      Name: 'lex-usecases-ap-southeast-2'
+    eu-central-1:
+      Name: 'lex-usecases-eu-central-1'
+    us-east-1:
+      Name: 'lex-usecases-us-east-1'
+    us-east-2:
+      Name: 'lex-usecases-us-east-2'
+    us-west-2:
+      Name: 'lex-usecases-us-west-2'
+
+Conditions:
+  CreateCMK: !Equals [!Ref pUseCMK, 'yes']
+  CreateErrorAlarms: !Equals [!Ref pCloudWatchErrorAlarms, 'yes']
+  CreateWarningAlarms: !Equals [!Ref pCloudWatchWarningAlarms, 'yes']
+  SubscribeEmailAddressErrors: !And [!Condition CreateErrorAlarms, !Not [!Equals [!Ref pErrorAlarmEmailSubscription, '']]]
+  SubscribeEmailAddressWarnings: !And [!Condition CreateWarningAlarms, !Not [!Equals [!Ref pWarningAlarmEmailSubscription, '']]]
+
+Resources:
+  SQSQueue:
+    Type: AWS::SQS::Queue
+    #!If: CreateCMK
+    #  - DependsOn: CustomerManagedKey
+    #  - !Ref "AWS::NoValue"
+    Properties:
+      QueueName: !Sub
+       - '${ID}-hallucination-detection'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      DelaySeconds: 0
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: 600
+      KmsMasterKeyId: !If [CreateCMK, !Ref CustomerManagedKey, "alias/aws/sqs"]
+
+  HallucinationDetectionFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: write-cloudwatch-logs
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: WriteCloudWatchLogs
+            Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:CreateLogGroup
+            - logs:PutLogEvents
+            Resource: !Sub
+              - 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ID}-hallucination-detection-function*'
+              - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      - 'Fn::If':
+        - CreateCMK
+        - 
+            PolicyName: decrypt-sqs-message
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                  Resource: !GetAtt CustomerManagedKey.Arn
+        - !Ref "AWS::NoValue"
+      - PolicyName: invoke-bedrock-model
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: InvokeBedrockModel
+            Effect: Allow
+            Action:
+            - bedrock:InvokeModel
+            Resource: "arn:aws:bedrock:*::foundation-model/*"
+
+      - PolicyName: process-sqs-queue
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: ProcessSQSQueue
+            Effect: Allow
+            Action:
+            - sqs:DeleteMessage
+            - sqs:ReceiveMessage
+            - sqs:GetQueueAttributes
+            Resource: !GetAtt SQSQueue.Arn
+
+  HallucinationDetectionFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    #!If: CreateCMK
+    #  - DependsOn: CustomerManagedKey
+    #  - !Ref "AWS::NoValue"
+    Properties:
+      RetentionInDays: 30
+      KmsKeyId: !If [CreateCMK, !GetAtt CustomerManagedKey.Arn, !Ref "AWS::NoValue"]
+      LogGroupName: !Sub
+       - '/aws/lambda/${ID}-hallucination-detection-function'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+
+  HallucinationDetectionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+       - '${ID}-hallucination-detection-function'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      Description: This function uses Anthropic Claude 2.1 to detect hallucinations in responses from a RAG solution
+      Handler: index.handler
+      Role: !GetAtt HallucinationDetectionFunctionRole.Arn
+      Runtime: python3.12
+      Timeout: 600
+      MemorySize: 1024
+      Code:
+        # S3Bucket: !FindInMap [BucketName, !Ref "AWS::Region", 'Name']
+        S3Bucket: !Ref pS3BlogArtifactsBucket
+        S3Key: !FindInMap [S3Path, 'DetectionFunctionSource', 'Name']
+      Environment:
+        Variables:
+          LLM: !Ref pHallucinationDetectionLLM
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: Customer can use VPC if desired
+          - id: W92 
+            reason: Async function does not require reserved concurrency
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: Customer can use VPC if desired
+          - id: CKV_AWS_116
+            comment: Customer can add DLQ and handling if desired
+          - id: CKV_AWS_115
+            comment: Async function does not require reserved concurrency
+          - id: CKV_AWS_173
+            comment: No sensitive data in environment variables
+
+  LambdaSQSTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      EventSourceArn: !GetAtt SQSQueue.Arn
+      FunctionName: !GetAtt HallucinationDetectionFunction.Arn
+      MaximumBatchingWindowInSeconds: 60
+      Enabled: True
+      FunctionResponseTypes: 
+        - ReportBatchItemFailures
+
+  ErrorAlarmSNSTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateErrorAlarms
+    Properties:
+      TopicName: !Sub
+       - '${ID}-hallucination-detection-errors'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      KmsMasterKeyId: alias/aws/sns
+
+  SNSEmailSubscriptionErrors:
+    Type: AWS::SNS::Subscription
+    Condition: SubscribeEmailAddressErrors
+    Properties:
+      TopicArn: !Ref ErrorAlarmSNSTopic
+      Endpoint: !Ref pErrorAlarmEmailSubscription
+      Protocol: email
+
+  HallucinationDetectionFunctionErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: CreateErrorAlarms
+    DependsOn: ErrorAlarmSNSTopic
+    Properties: 
+      FilterName: !Sub
+        - '${ID}-hallucination-detection-errors'
+        - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      FilterPattern: "ERROR"
+      LogGroupName: !Ref HallucinationDetectionFunctionLogGroup
+      MetricTransformations: 
+        - MetricValue: "1"
+          Unit: Count
+          MetricNamespace: !Sub
+           - '${ID}-hallucination-detection'
+           - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+          MetricName: !Sub
+           - '${ID}-hallucination-detection-errors'
+           - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+
+  HallucinationDetectionFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateErrorAlarms
+    Properties:
+      AlarmName: !Sub
+       - '${ID}-hallucination-detection-errors'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      AlarmDescription: Alarm on ERROR log entries in hallucination detection Lambda logs
+      AlarmActions: 
+       - !Ref ErrorAlarmSNSTopic
+      MetricName: !Sub
+       - '${ID}-hallucination-detection-errors'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      Namespace: !Sub
+       - '${ID}-hallucination-detection'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      Statistic: SampleCount
+      TreatMissingData: notBreaching
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '0'
+      ComparisonOperator: GreaterThanThreshold
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Alarm name preferred for convenience
+
+  WarningAlarmSNSTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateWarningAlarms
+    Properties:
+      TopicName: !Sub
+       - '${ID}-hallucination-detection-warnings'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      KmsMasterKeyId: alias/aws/sns
+
+  SNSEmailSubscriptionWarnings:
+    Type: AWS::SNS::Subscription
+    Condition: SubscribeEmailAddressWarnings
+    Properties:
+      TopicArn: !Ref WarningAlarmSNSTopic
+      Endpoint: !Ref pWarningAlarmEmailSubscription
+      Protocol: email
+
+  HallucinationDetectionFunctionWarningMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: CreateWarningAlarms
+    DependsOn: WarningAlarmSNSTopic
+    Properties: 
+      FilterName: !Sub
+        - '${ID}-hallucination-detection-warnings'
+        - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      FilterPattern: "WARNING"
+      LogGroupName: !Ref HallucinationDetectionFunctionLogGroup
+      MetricTransformations: 
+        - MetricValue: "1"
+          Unit: Count
+          MetricNamespace: !Sub
+           - '${ID}-hallucination-detection'
+           - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+          MetricName: !Sub
+           - '${ID}-hallucination-detection-warnings'
+           - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+
+  HallucinationDetectionFunctionWarningAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateWarningAlarms
+    Properties:
+      AlarmName: !Sub
+       - '${ID}-hallucination-detection-warnings'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      AlarmDescription: Alarm on WARNING log entries in hallucination detection Lambda logs
+      AlarmActions: 
+       - !Ref WarningAlarmSNSTopic
+      MetricName: !Sub
+       - '${ID}-hallucination-detection-warnings'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      Namespace: !Sub
+       - '${ID}-hallucination-detection'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      Statistic: SampleCount
+      TreatMissingData: notBreaching
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '0'
+      ComparisonOperator: GreaterThanThreshold
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Alarm name preferred for convenience
+
+  CustomerManagedKey:
+    Type: 'AWS::KMS::Key'
+    Condition: CreateCMK
+    Properties:
+      Description: Customer-managed key for CloudWatch logs 
+      Enabled: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      MultiRegion: 'true'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow use of the key - hallucination function log group
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub 
+                  - arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ID}-hallucination-detection-function
+                  - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+          - Sid: Allow use of the key - SQS Queue
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                # kms:EncryptionContext:aws:logs:arn: !GetAtt SQSQueue.Arn
+                kms:EncryptionContext:aws:logs:arn: !Sub
+                  - arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${ID}-hallucination-detection
+                  - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+
+  CustomerManagedKeyAlias:
+    Type: 'AWS::KMS::Alias'
+    Condition: CreateCMK
+    Properties:
+      AliasName: !Sub
+       - 'alias/${ID}-rag-solution-key'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      TargetKeyId: !Ref CustomerManagedKey
+
+Outputs:
+  SQSQueueName:
+    Description: SQS queue name
+    Value: !GetAtt SQSQueue.QueueName
+    Export:
+      Name: !Sub "${AWS::StackName}-SQSQueueName"
+  SQSQueueArn:
+    Description: SQS queue ARN
+    Value: !GetAtt SQSQueue.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-SQSQueueArn"
+  KMSKeyArn:
+    Condition: CreateCMK
+    Description: KMS Key ARN
+    Value: !GetAtt CustomerManagedKey.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-KMSKeyArn"
+  ErrorAlarmSNSTopicArn:
+    Condition: CreateErrorAlarms
+    Description: SNS topic for subscribing to data pipeline errors
+    Value: !Ref ErrorAlarmSNSTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-ErrorAlarmSNSTopicArn"
+  WarningAlarmSNSTopicArn:
+    Condition: CreateWarningAlarms
+    Description: SNS topic for subscribing to data pipeline warnings
+    Value: !Ref WarningAlarmSNSTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-WarningAlarmSNSTopicArn"
+

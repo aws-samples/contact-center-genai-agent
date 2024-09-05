@@ -1,0 +1,1298 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: >
+  Creates a Lex conversation logs data pipeline with Kinesis Data Firehose to S3 and Athena
+
+Parameters:
+  pLogGroupName:
+    Description: Enter the name (not the ARN) of the CloudWatch Logs log group where your Lex bot conversation logs are configured
+    Type: String
+  pRedactSensitiveData:
+    Type: String
+    Default: 'no'
+    AllowedValues:
+      - 'no'
+      - 'yes'
+    Description: Use Amazon Comprehend to redact sensitive data (e.g.,PII)?
+  pPiiEntityTypes:
+    Default: 'ALL'
+    Type: String
+    Description: List of PII entity types (see https://docs.aws.amazon.com/comprehend/latest/dg/how-pii.html for entity types, or enter 'ALL' for all entity types)
+  pRedactionThreshold:
+    Default: '0.0'
+    Type: String
+    Description: Amazon Comprehend confidence score threshold
+  pAllowUnredactedLogging:
+    Type: String
+    Default: 'yes'
+    AllowedValues:
+      - 'no'
+      - 'yes'
+    Description: Allow the Lambda transform function to include unredacted data in its application logs? (Not recommended for Production)
+  pUseCMK:
+    Type: String
+    Default: 'no'
+    AllowedValues:
+      - 'no'
+      - 'yes'
+    Description: Create a customer-managed KMS key for encrypting Lambda logs and the S3 bucket. Make sure QuickSight is activated in your account.
+  pPurgeSourceLogStreams:
+    Type: String
+    Default: 'no'
+    AllowedValues:
+      - 'no'
+      - 'yes'
+    Description: Purge source log streams from the CloudWatch Logs log group after processing?
+  pCloudWatchErrorAlarms:
+    Type: String
+    Default: 'no'
+    AllowedValues:
+      - 'no'
+      - 'yes'
+    Description: Create CloudWatch alarms for error conditions in the data pipeline?
+  pErrorAlarmEmailSubscription:
+    Type: String
+    Default: ''
+    Description: Leave blank, or provide a single email address/distribution list to receive CloudWatch error alarm notifications
+  pCloudWatchWarningAlarms:
+    Type: String
+    Default: 'no'
+    AllowedValues:
+      - 'no'
+      - 'yes'
+    Description: Create CloudWatch alarms for warning conditions in the data pipeline?
+  pWarningAlarmEmailSubscription:
+    Type: String
+    Default: ''
+    Description: Leave blank, or provide a single email address/distribution list to receive CloudWatch warning alarm notifications
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: Conversation Logs
+      Parameters:
+      - pLogGroupName
+      - pPurgeSourceLogStreams
+      - pRedactSensitiveData
+      - pPiiEntityTypes
+      - pRedactionThreshold 
+      - pAllowUnredactedLogging
+      - pUseCMK
+      - pCloudWatchErrorAlarms
+      - pErrorAlarmEmailSubscription
+      - pCloudWatchWarningAlarms
+      - pWarningAlarmEmailSubscription
+    ParameterLabels:
+      pLogGroupName:
+        default: CloudWatch Logs log group for Lex Conversation Logs
+      pRedactSensitiveData:
+        default: Redact Sensitive Data?
+      pPiiEntityTypes:
+        default: List of PII entity types to redact
+      pRedactionThreshold:
+        default: Minimum confidence score for Amazon Comprehend redaction
+      pAllowUnredactedLogging:
+        default: Allow unredacted application logs?
+      pUseCMK:
+        default: Create a Customer-Managed Key (CMK)?
+      pPurgeSourceLogStreams:
+        default: Purge Source Logs?
+      pCloudWatchErrorAlarms:
+        default: Create CloudWatch ERROR alarms?
+      pErrorAlarmEmailSubscription:
+        default: Subscribe to CloudWatch ERROR alarms?
+      pCloudWatchWarningAlarms:
+        default: Create CloudWatch WARNING alarms?
+      pWarningAlarmEmailSubscription:
+        default: Subscribe to CloudWatch WARNING alarms?
+
+Conditions:
+  CreateCMK: !Equals [!Ref pUseCMK, 'yes']
+  CreateErrorAlarms: !Equals [!Ref pCloudWatchErrorAlarms, 'yes']
+  CreateWarningAlarms: !Equals [!Ref pCloudWatchWarningAlarms, 'yes']
+  SubscribeEmailAddressErrors: !And [!Condition CreateErrorAlarms, !Not [!Equals [!Ref pErrorAlarmEmailSubscription, '']]]
+  SubscribeEmailAddressWarnings: !And [!Condition CreateWarningAlarms, !Not [!Equals [!Ref pWarningAlarmEmailSubscription, '']]]
+
+Resources:
+  LambdaTransformRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+       - '${ID}-lambda-transform-role'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: write-cloudwatch-logs
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: WriteCloudWatchLogs
+            Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:CreateLogGroup
+            - logs:PutLogEvents
+            Resource: !Sub
+              - 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ID}-firehose-lambda*'
+              - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+
+      - PolicyName: delete-cloudwatch-log-streams
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: DeleteCloudWatchLogs
+            Effect: Allow
+            Action:
+            - logs:DeleteLogStream
+            Resource: 
+                !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${pLogGroupName}*
+      - PolicyName: call-comprehend # Reference: https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazoncomprehend.html
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: CallComprehend
+            Effect: Allow
+            Action:
+            - comprehend:DetectPiiEntities
+            Resource: "*"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: DetectPiiEntities does not use resource specifications
+          - id: W28
+            reason: Role name preferred for convenience
+
+  KinesisDeliveryStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+       - '${ID}-kinesis-delivery-stream-role'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - firehose.amazonaws.com
+            - s3.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: deliveryToS3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Sid: deliveryToS3
+              Effect: Allow
+              Action:
+              - s3:AbortMultipartUpload
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:ListBucketMultipartUploads
+              - s3:PutObject
+              Resource: !Sub
+                - 'arn:aws:s3:::${ID}-lex-conversation-logs*/*'
+                - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+
+        - PolicyName: invokeLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Sid: lambda
+              Effect: Allow
+              Action:
+              - lambda:InvokeFunction
+              Resource: !Sub
+              - 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ID}-firehose-lambda'
+              - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Role name preferred for convenience
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+       - '${ID}-glue-crawler-role'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "glue.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "cloudwatch-logs"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: cloudwatchLogs
+                Effect: "Allow"
+                Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Resource: 
+                  arn:aws:logs:*:*:/aws-glue/*
+
+        - PolicyName: "cloudwatch-get-metrics" # Reference: https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazoncloudwatch.html
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: cloudwatchGetMetrics
+                Effect: "Allow"
+                Action:
+                - cloudwatch:GetMetricData
+                Resource: 
+                  "*"
+
+        - PolicyName: "crawl-S3-bucket"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: crawlS3Bucket
+                Effect: "Allow"
+                Action:
+                - s3:ListAllMyBuckets
+                - s3:ListBucket
+                - s3:GetBucketLocation
+                - s3:GetBucketAcl
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+                - s3:CreateBucket
+                Resource: 
+                  - !Sub
+                      - 'arn:aws:s3:::${ID}-lex-conversation-logs*'
+                      - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+                  - !Sub
+                      - 'arn:aws:s3:::${ID}-lex-conversation-logs*/*'
+                      - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+
+        - PolicyName: "glue"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: glue
+                Effect: "Allow"
+                Action:
+                - glue:BatchCreatePartition
+                - glue:CreatePartitionIndex
+                - glue:DeleteDatabase
+                - glue:GetTableVersions
+                - glue:GetPartitions
+                - glue:BatchDeletePartition
+                - glue:DeleteTableVersion
+                - glue:UpdateTable
+                - glue:DeleteTable
+                - glue:GetTableVersion
+                - glue:CreatePartition
+                - glue:UpdatePartition
+                - glue:UpdateDatabase
+                - glue:CreateTable
+                - glue:BatchUpdatePartition
+                - glue:GetTables
+                - glue:BatchGetPartition
+                - glue:GetDatabases
+                - glue:GetPartitionIndexes
+                - glue:GetTable
+                - glue:GetDatabase
+                - glue:GetPartition
+                - glue:CreateDatabase
+                - glue:BatchDeleteTableVersion
+                - glue:BatchDeleteTable
+                - glue:DeletePartition
+                Resource: 
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub
+                      - 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${ID}-database*'
+                      - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+                  - !Sub
+                      - 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${ID}-database*/*'
+                      - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+
+        - PolicyName: "glue-security-config"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: glueSecurityConfig
+                Effect: "Allow"
+                Action:
+                - glue:GetSecurityConfigurations
+                - glue:GetSecurityConfiguration
+                Resource: "*"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: cloudwatch:GetMetricData and glue:GetSecurityConfigurations do not require resource types
+          - id: W28
+            reason: Role name preferred for convenience
+
+  CloudwatchLogsToKinesisRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub
+       - '${ID}-cloudwatch-logs-to-kinesis-role'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Action: 'sts:AssumeRole'
+            Principal:
+              Service:
+                - Fn::Join:
+                    - '.'
+                    - - logs
+                      - !Ref "AWS::Region"
+                      - amazonaws.com
+      Path: '/'
+      Policies:
+        - PolicyName: AllowCloudwatchToKinesisPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                - firehose:ListDeliveryStreams
+                - firehose:DescribeDeliveryStream
+                - firehose:CreateDeliveryStream
+                - firehose:PutRecord
+                - firehose:PutRecordBatch
+                Resource: !Sub
+                  - 'arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${ID}-kinesis-delivery-stream'
+                  - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+              - Effect: 'Allow'
+                Action: 'iam:PassRole'
+                Resource:
+                  Fn::Join:
+                    - ':'
+                    - - 'arn:aws:iam:'
+                      - !Ref "AWS::AccountId"
+                      - 'role/CWLtoKinesisRole'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Role name preferred for convenience
+
+  CustomerManagedKey:
+    Type: 'AWS::KMS::Key'
+    Condition: CreateCMK
+    Properties:
+      Description: Customer-managed key for Lambda logs and S3
+      Enabled: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      MultiRegion: 'true'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow use of the key - CloudWatch Logs group for the Firehose Lambda function
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub
+                  - arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ID}-firehose-lambda
+                  - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+          - Sid: Allow use of the key - Lex conversation logs CloudWatch Logs group 
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${pLogGroupName}
+          - Sid: Allow use of the key - Kinesis Data Firehose
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt KinesisDeliveryStreamRole.Arn
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+          - Sid: Allow use of the key - Glue Crawler
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt GlueCrawlerRole.Arn
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+          - Sid: Allow use of the key - QuickSight
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:role/service-role/aws-quicksight-service-role-v0
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+
+  CustomerManagedKeyAlias:
+    Type: 'AWS::KMS::Alias'
+    Condition: CreateCMK
+    Properties:
+      AliasName: !Sub
+       - 'alias/${ID}-lex-data-pipeline-key'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      TargetKeyId: !Ref CustomerManagedKey
+
+  FirehoseTransformLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+      KmsKeyId: !If [CreateCMK, !GetAtt CustomerManagedKey.Arn, !Ref "AWS::NoValue"]
+      LogGroupName: !Sub
+       - '/aws/lambda/${ID}-firehose-lambda'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+
+  FirehoseTransformLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+       - '${ID}-firehose-lambda'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      Description: This function performs a transformation on CloudWatch Logs data from Lex Conversation Logs, for Glue/Athena
+      Handler: index.handler
+      Role: !GetAtt LambdaTransformRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          PURGE_SOURCE_LOGS: !Sub "${pPurgeSourceLogStreams}"
+          REDACT_SENSITIVE_DATA: !Sub "${pRedactSensitiveData}"
+          PII_ENTITY_TYPES: !Sub "${pPiiEntityTypes}"
+          SENSITIVE_DATA_SCORE_THRESHOLD: !Sub "${pRedactionThreshold}"
+          UNREDACTED_LOGGING: !Sub "${pAllowUnredactedLogging}"
+      Code:
+        ZipFile: !Sub |
+          #
+          # Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          # 
+          # Permission is hereby granted, free of charge, to any person obtaining a copy of this
+          # software and associated documentation files (the "Software"), to deal in the Software
+          # without restriction, including without limitation the rights to use, copy, modify,
+          # merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+          # permit persons to whom the Software is furnished to do so.
+          # 
+          # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+          # INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+          # PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+          # HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+          # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+          # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+          #
+          
+          import base64
+          import logging
+          import json
+          import gzip
+          import io
+          import os
+          import re
+          import collections
+          from collections import defaultdict
+          import boto3
+          from botocore.exceptions import ClientError
+          import dateutil.parser
+          import time
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          logs_client = boto3.client('logs')
+          comprehend_client = boto3.client('comprehend')
+          
+          PURGE_SOURCE_LOGS = True if os.environ.get('PURGE_SOURCE_LOGS', 'no').lower() == 'yes' else False
+          REDACT_SENSITIVE_DATA = True if os.environ.get('REDACT_SENSITIVE_DATA', 'no').lower() == 'yes' else False
+          PII_ENTITY_TYPES = os.environ.get('PII_ENTITY_TYPES', 'ALL')
+          SENSITIVE_DATA_SCORE_THRESHOLD = float(os.environ.get('SENSITIVE_DATA_SCORE_THRESHOLD', "0.4"))
+          UNREDACTED_LOGGING = True if os.environ.get('UNREDACTED_LOGGING', 'no').lower() == 'yes' else False
+          REDACTED_MESSAGE = '[REDACTED]'
+          
+          def handler(event, context):
+              logger.info('<<firehose-transform>> event = {}'.format(
+                  json.dumps(event) if UNREDACTED_LOGGING else REDACTED_MESSAGE))
+          
+              output = []
+              
+              records_processed = 0
+              records_dropped = 0
+              record_id_suffix=0
+              
+              logger.info('<<firehose-transform>> PURGE_SOURCE_LOGS: {}'.format(PURGE_SOURCE_LOGS))
+              logger.info('<<firehose-transform>> REDACT_SENSITIVE_DATA: {}'.format(REDACT_SENSITIVE_DATA))
+              logger.info('<<firehose-transform>> SENSITIVE_DATA_SCORE_THRESHOLD: {}'.format(SENSITIVE_DATA_SCORE_THRESHOLD))
+              logger.info('<<firehose-transform>> UNREDACTED_LOGGING: {}'.format(UNREDACTED_LOGGING))
+          
+              # keep track of log streams processed in case they need to be purged
+              log_group_name = None
+              log_streams = defaultdict(int)
+          
+              # time the batch    
+              start_time = time.perf_counter()
+          
+              for record in event['records']:
+                  output_payload_str = ""
+                  
+                  logger.debug('<<firehose-transform>> input record = {}'.format(
+                      json.dumps(record) if UNREDACTED_LOGGING else REDACTED_MESSAGE))
+                  
+                  # decode and unzip the data
+                  data = base64.b64decode(record['data'])
+                  striodata = io.BytesIO(data)
+                  with gzip.GzipFile(fileobj=striodata, mode='r') as f:
+                      data = json.loads(f.read())
+          
+                  logger.debug("<<firehose-transform>> decoded payload = {}".format(
+                      str(data) if UNREDACTED_LOGGING else REDACTED_MESSAGE))
+          
+                  payload_str = json.dumps(data)
+          
+                  logger.debug("<<firehose-transform>> payload_str = {}".format(
+                      payload_str if UNREDACTED_LOGGING else REDACTED_MESSAGE))
+          
+                  payload_dict = json.loads(payload_str)
+                  
+                  if PURGE_SOURCE_LOGS:
+                      log_group_name = payload_dict.get('logGroup', None)
+                      log_stream = payload_dict.get('logStream', None)
+                      if log_stream:
+                          log_streams[log_stream] += 1
+          
+                  # skip CloudWatch Logs control messages
+                  message_type = payload_dict.get('messageType', None)
+                  if not message_type:
+                      logger.info('<<firehose-transform>> DROPPING record: no messageType value')
+                      records_dropped += 1
+                      output_record = {
+                          'recordId': record['recordId'],
+                          'result': 'Dropped',
+                          'data': record['data']
+                      }
+                      output.append(output_record)
+                      continue
+          
+                  if message_type == "CONTROL_MESSAGE":
+                      logger.info('<<firehose-transform>> DROPPING record: skipping CONTROL_MESSAGE')
+                      records_dropped += 1
+                      output_record = {
+                          'recordId': record['recordId'],
+                          'result': 'Dropped',
+                          'data': record['data']
+                      }
+                      output.append(output_record)
+                      continue
+          
+                  log_events = payload_dict.get("logEvents")
+                  if not log_events:
+                      logger.info('<<firehose-transform>> DROPPING record: can\'t find logEvents in payload')
+                      records_dropped += 1
+                      output_record = {
+                          'recordId': record['recordId'],
+                          'result': 'Dropped',
+                          'data': record['data']
+                      }
+                      output.append(output_record)
+                      continue
+                  
+                  if len(log_events) == 0:
+                      logger.info('<<firehose-transform>> DROPPING record: logEvents in payload is empty')
+                      records_dropped += 1
+                      output_record = {
+                          'recordId': record['recordId'],
+                          'result': 'Dropped',
+                          'data': record['data']
+                      }
+                      output.append(output_record)
+                      continue
+                  
+                  for event in log_events:
+                      message = event.get("message")
+                      if not message:
+                          logger.info('<<firehose-transform>> DROPPING record: can\'t find message in payload')
+                          records_dropped += 1
+                          output_record = {
+                              'recordId': record['recordId'],
+                              'result': 'Dropped',
+                              'data': record['data']
+                          }
+                          output.append(output_record)
+                          continue
+              
+                      # flatten out the JSON structure to make it easier for querying
+                      message_dict = json.loads(message)
+                      if message_dict.get('messageVersion', '') == '1.0':
+                          logger.info('<<firehose-transform>> PROCESSING Lex V1 record: input message={}'.format(
+                              json.dumps(message_dict) if UNREDACTED_LOGGING else REDACTED_MESSAGE))
+                          message_dict = process_LexV1_log(message_dict)
+                      elif message_dict.get('messageVersion', '') == '2.0':
+                          logger.info('<<firehose-transform>> PROCESSING Lex V2 record: input message={}'.format(
+                              json.dumps(message_dict) if UNREDACTED_LOGGING else REDACTED_MESSAGE))
+                          message_dict = process_LexV2_log(message_dict)
+                      else:
+                          logger.error('<<firehose-transform>> UNKNOWN LEX MESSAGE VERSION')
+                          continue
+              
+                      # scan the flattened JSON for any sensitive data, and redact if found (via Comprehend)
+                      if REDACT_SENSITIVE_DATA:
+                          message_dict = redact_all(message_dict)
+              
+                      logger.info('<<firehose-transform>> PROCESSED record: output message={}'.format(
+                          json.dumps(message_dict) if UNREDACTED_LOGGING else REDACTED_MESSAGE))
+                      output_payload_str += json.dumps(message_dict) + '\n'
+                      records_processed += 1
+                      
+                  output_record = {
+                      'recordId': record['recordId'],
+                      'result': 'Ok',
+                      'data': base64.b64encode(output_payload_str.encode('ascii')).decode('ascii')
+                  }
+                  output.append(output_record)
+          
+              duration = time.perf_counter() - start_time
+          
+              logger.info('<<firehose-transform>> Successfully processed {} records, dropped {} records in {} ms.'.format(
+                  records_processed, records_dropped, int(duration * 1000)))
+              logger.debug('<<firehose-transform>> output records = {}'.format(
+                  json.dumps(output) if UNREDACTED_LOGGING else REDACTED_MESSAGE))
+              
+              if PURGE_SOURCE_LOGS:
+                  streams_purged = 0
+                  records_purged = 0
+                  logger.info('<<firehose-transform>> purging {} source log streams from log group: {}'.format(
+                      len(log_streams), log_group_name))
+                  for stream in log_streams.keys():
+                      logger.info('<<firehose-transform>> -- purging log stream {} with {} records'.format(
+                          stream, log_streams[stream]))
+                      
+                      try:            
+                          logs_client.delete_log_stream(logGroupName=log_group_name, logStreamName=stream)
+                          streams_purged += 1
+                          records_purged += log_streams[stream]
+                      except ClientError as e:
+                          logger.warn('<<firehose-transform>> - exception trying to delete log stream: {}'.format(stream))
+                          logger.warn('<<firehose-transform>> - Exception: {}'.format(repr(e)))
+          
+                  logger.info('<<firehose-transform>> purged {} log streams with {} log records'.format(
+                      streams_purged, records_purged))
+          
+              return {'records': output}
+              
+          
+          # similar to pandas json_normalize(), but opinionated about lists, and with key renaming
+          def flatten_json(input, prefix, output, key_transforms=None):
+              if type(input) in [int, float, str, bool, type(None)]:
+                  key = transform_key(prefix.lower(), key_transforms)
+                  if key is not None:
+                      output[key.replace(':','_').replace('-','_')] = input
+          
+              if type(input) == dict:
+                  if prefix is None:
+                      prefix = ''
+                  else:
+                      prefix = prefix + '_'
+          
+                  for key in input.keys():
+                      value = input[key]
+                      value_type = str(type(input[key]))
+                      if type(input[key]) in [int, float, str, bool, type(None)]:
+                          output_key = transform_key((prefix + key).lower(), key_transforms)
+                          if output_key is not None:
+                              output[output_key.replace(':','_').replace('-','_')] = input[key]
+                      elif type(input[key]) == dict:
+                          output = flatten_json(input[key], (prefix + key), output, key_transforms)
+                      elif type(input[key]) == list:
+                          for index, item in enumerate(input[key]):
+                              output = flatten_json(item, (prefix + key) + ('_' + str(index)), output, key_transforms)
+          
+              return output
+          
+          
+          # attribute name substitutions for Lex V2
+          TRANSFORMS_LEXV2 = {
+              r'^sessionstate_sessionattributes_': r'attribute_',
+              r'^sessionstate_intent_slots_': r'slot_',
+              r'^sessionstate_originatingrequestid': r'originatingrequestid',
+              r'^sessionstate_intent_name': r'intent_name',
+              r'^sessionstate_intent_state': r'intent_state',
+              r'^sessionstate_intent_confirmationstate': r'intent_confirmationstate',
+              r'^sessionstate_dialogaction_type': r'dialogaction_type',
+              r'^sessionstate_dialogaction_slottoelicit$': r'slottoelicit',
+              r'^sessionstate_dialogaction_slotelicitationstyle$': r'slotelicitationstyle',
+              r'^requestattributes_': r'request_attribute_',
+              r'_value_originalvalue$': r'_originalvalue',
+              r'_value_interpretedvalue$': r'',
+              r'_value_resolvedvalues': None,  # delete
+              r'^interpretations_([0-9])_': r'alt_\1_',
+              r'^alt_([0-9])_intent_slots_': r'alt_\1_slot_',
+              r'_transcriptionconfidence$': r'_confidence',
+              r'_transcription$': r'',
+              r'_resolvedslots_': r'_slot_',
+              r'^(transcriptions_[0-9]_slot_.*)_originalsalue$': r'\1',
+              r'_resolvedcontext_intent$': r'_intent', 
+              r'^messages_([0-9])_contenttype': r'message_\1_type',
+              r'^messages_([0-9])_content': r'message_\1',
+              r'^sentimentresponse_sentimentscore_': r'sentiment_',
+              r'^sentimentresponse_sentiment$': r'sentiment_label',
+              r'^alt_0_': r'',
+              r'^alt_([1-9])_sentimentresponse_sentiment$': None,  # delete
+              r'^alt_([1-9])_sentimentresponse_sentimentscore_': None,  # delete
+              r'_shape$': None,  # delete
+              r'_callback_event': None,  # delete
+              r'_ssn': None  # example to delete any key containing 'ssn'
+          }
+          
+          # attribute name substitutions for Lex V1, renamed to align with Lex V2
+          TRANSFORMS_LEXV1 = {
+              r'^botalias$': r'bot_aliasname',
+              r'^botname$': r'bot_name',
+              r'^botresponse$': r'message_0',
+              r'^botversion$': r'bot_version',
+              r'^dialogstate$': r'intent_state',
+              r'^inputdialogmode$': r'inputmode',
+              r'^locale$': r'bot_localeid',
+              r'^nluintentconfidence$': r'nluconfidence',
+              r'^sessionattributes_': r'attribute_',
+              r'^requestattributes_': r'request_attribute_',
+              r'^slots_': r'slot_',
+              r'^intent$': r'intent_name',
+              r'^alternativeintents_([0-9])_name': r'alt_\1_intent_name',
+              r'^alternativeintents_([0-9])_slots_': r'alt_\1_slot_',
+              r'^alternativeintents_([0-9])_nluintentconfidence': r'alt_\1_nluconfidence',
+              r'^alt_0_': None, # delete
+              r'^sentimentresponse_': r'',
+              r'^sentimentlabel$': r'sentiment_label',
+              r'_callback_event': None  # delete
+          }
+          
+          # keep a do-not-process list in case of recursion errors
+          recursive_patterns = []
+          
+          def transform_key(key, key_transforms=None):
+              global recursive_patterns
+              if key_transforms is None:
+                  return key
+              else:
+                  for pattern, replacement in key_transforms.items():
+                      if pattern in recursive_patterns:
+                          continue
+                      match = re.search(pattern, key)
+                      if match:
+                          if replacement is None:
+                              return None
+                          transformed_key = re.sub(pattern, replacement, key)
+                          # try again, in case there are more relevant transformations  
+                          try:            
+                              return transform_key(transformed_key, key_transforms)
+                          except RecursionError as e:
+                              logger.warn('<<firehose-transform>> - Exception: {}'.format(repr(e)))
+                              logger.warn('<<firehose-transform>> - recursion error processing pattern "{}" key "{}"'.format(
+                                  pattern, transformed_key))
+                              logger.warn('<<firehose-transform>> - adding pattern "{}" to the do-not-process list'.format(
+                                  pattern))
+                              recursive_patterns.append(pattern) # don't use this one anymore!
+                              continue
+                  return key
+          
+          
+          def process_LexV1_log(message_dict):
+              output_json = {}
+              flatten_json(input=message_dict, prefix=None, output=output_json, key_transforms=TRANSFORMS_LEXV1)
+              
+              # extract sentiment scores if present
+              if output_json.get('sentimentscore', None):
+                  # expecting string such as '{Positive: 3.634553E-4,Negative: 0.99010056,Neutral: 0.009535047,Mixed: 9.968452E-7}'
+                  scores = output_json['sentimentscore'].translate({ord(i): None for i in '{}'})
+                  scores = scores.split(',')
+                  for score in scores:
+                      values = score.split(': ')
+                      if len(values) == 2:
+                          output_json['sentiment_'+values[0].lower()] = float(values[1])
+                  del output_json['sentimentscore']
+              
+              # add some date fields for convenience
+              if output_json.get('timestamp', None):
+                  dt = dateutil.parser.isoparse(output_json['timestamp'])
+                  if dt:
+                      output_json['request_year'] = str(dt.year)
+                      output_json['request_month'] = "{:d}-{:02d}".format(dt.year, dt.month)
+                      output_json['request_day'] = "{:d}-{:02d}-{:02d}".format(dt.year, dt.month, dt.day)
+                      output_json['request_hour'] = "{:d}-{:02d}-{:02d}T{:02d}".format(dt.year, dt.month, dt.day, dt.hour)
+                      output_json['request_minute'] = "{:d}-{:02d}-{:02d}T{:02d}:{:02d}".format(dt.year, dt.month, dt.day, dt.hour, dt.minute)
+                      output_json['request_datetime'] = "{:d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}".format(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)
+                      output_json['request_timezone'] = "UTC"        
+              
+              output_json = collections.OrderedDict(sorted(output_json.items()))
+              return output_json
+          
+          
+          def process_LexV2_log(message_dict):
+              output_json = {}
+              flatten_json(input=message_dict, prefix=None, output=output_json, key_transforms=TRANSFORMS_LEXV2)
+              
+              # add some date fields for convenience
+              if output_json.get('timestamp', None):
+                  dt = dateutil.parser.isoparse(output_json['timestamp'])
+                  if dt:
+                      output_json['request_year'] = str(dt.year)
+                      output_json['request_month'] = "{:d}-{:02d}".format(dt.year, dt.month)
+                      output_json['request_day'] = "{:d}-{:02d}-{:02d}".format(dt.year, dt.month, dt.day)
+                      output_json['request_hour'] = "{:d}-{:02d}-{:02d}T{:02d}".format(dt.year, dt.month, dt.day, dt.hour)
+                      output_json['request_minute'] = "{:d}-{:02d}-{:02d}T{:02d}:{:02d}".format(dt.year, dt.month, dt.day, dt.hour, dt.minute)
+                      output_json['request_datetime'] = "{:d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}".format(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)
+                      output_json['request_timezone'] = "UTC"        
+              
+              output_json = collections.OrderedDict(sorted(output_json.items()))
+              return output_json
+          
+          
+          DO_NOT_REDACT_LIST = [r'^audioproperties_.*', r'^bargein', r'^bot_.*', r'^timestamp$', r'^request.*', r'^sessionid$']
+          
+          def redact_all(dict):
+              # process just the items that are strings, and not in the do not redact list 
+              # Note: this works for a flattened structure (no nesting)
+              copy = {}
+              for key, value in dict.items():
+                  if type(value) == str:
+                      matched = 0
+                      for pattern in DO_NOT_REDACT_LIST:
+                          if re.search(pattern, key):
+                              matched += 1
+                      if not matched:
+                          copy[key] = value
+          
+              # redact the rest
+              data = json.dumps(copy)
+              redacted, redacted_data = redact_sensitive_data(data)
+          
+              # replace the redacted values in the original dict
+              redacted_dict = json.loads(redacted_data)
+              result_dict = {key: redacted_dict.get(key, dict[key]) for key in dict}
+              logger.debug('<<firehose-transform>> result dict = : {}'.format(json.dumps(result_dict)))
+          
+              return result_dict
+              
+          
+          def redact_sensitive_data(input):
+              redacted = False
+              redacted_input = input
+              
+              logger.debug('<<firehose-transform>> calling Comprehend to detect sensitive data in: {}'.format(
+                  input if UNREDACTED_LOGGING else REDACTED_MESSAGE))
+          
+              try:
+                  response = comprehend_client.detect_pii_entities(Text=input,LanguageCode='en')
+              except Exception as e:
+                  logger.error('Exception calling Comprehend: {}'.format(str(e)))
+                  return False, None
+          
+              if response == None:
+                  logger.error('No response from Comprehend')
+                  return False, None
+                  
+              logger.debug('<<firehose-transform>> Comprehend response = {}'.format(
+                  json.dumps(response) if UNREDACTED_LOGGING else REDACTED_MESSAGE))
+          
+              hits = response.get('Entities', [])
+              offset = 0
+              for hit in hits:
+                  score = hit.get('Score', None)
+                  type = hit.get('Type', None)
+                  start = hit.get('BeginOffset', None)
+                  end = hit.get('EndOffset', None)
+                  logger.debug('score={}, type={}, start={}, end={}, offset={}'.format(score, type, start, end, offset))
+                  
+                  if PII_ENTITY_TYPES != 'ALL':
+                      if type not in PII_ENTITY_TYPES:
+                          continue
+                  
+                  if score and type and start and end:
+                      if score > SENSITIVE_DATA_SCORE_THRESHOLD:
+                          redacted = True
+                          
+                          if ':' in redacted_input[start+offset-1:end+offset+1]:
+                              value_offset = redacted_input[start+offset-1:end+offset+1].find(':')
+                              if value_offset >= 0:
+                                  start += value_offset + 2
+                                  
+                          redacted_input = redacted_input[:(start+offset)] + '[' + type + ']' + redacted_input[(end+offset):]
+                          offset += len('[' + type + ']') - (end-start)
+                          logger.debug('redacted input = {}'.format(
+                              redacted_input if UNREDACTED_LOGGING else REDACTED_MESSAGE))
+                      else:
+                          logger.debug('did not redact input = {}'.format(
+                              redacted_input if UNREDACTED_LOGGING else REDACTED_MESSAGE))
+          
+              return redacted, redacted_input
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: Customer can use VPC if desired
+          - id: W92 
+            reason: Async function does not require reserved concurrency
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: Customer can use VPC if desired
+          - id: CKV_AWS_116
+            comment: Customer can add DLQ and handling if desired
+          - id: CKV_AWS_115
+            comment: Async function does not require reserved concurrency
+          - id: CKV_AWS_173
+            comment: No sensitive data in environment variables
+
+  KinesisDeliveryStream:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      DeliveryStreamType: DirectPut
+
+      DeliveryStreamEncryptionConfigurationInput:
+         KeyARN: !If [CreateCMK, !GetAtt CustomerManagedKey.Arn, !Ref "AWS::NoValue"]
+         KeyType: !If [CreateCMK, CUSTOMER_MANAGED_CMK, AWS_OWNED_CMK]
+
+      DeliveryStreamName: !Sub
+       - '${ID}-kinesis-delivery-stream'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt LexConversationLogsBucket.Arn
+        BufferingHints:
+          IntervalInSeconds: '60'
+          SizeInMBs: '1'
+        CompressionFormat: UNCOMPRESSED
+        RoleARN: !GetAtt KinesisDeliveryStreamRole.Arn
+        ProcessingConfiguration:
+          Enabled: 'true'
+          Processors:
+            - Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt FirehoseTransformLambda.Arn
+              Type: Lambda
+        EncryptionConfiguration:
+          Fn::If:
+          - CreateCMK
+          - KMSEncryptionConfig:
+              AWSKMSKeyARN: !GetAtt CustomerManagedKey.Arn
+          - Ref: AWS::NoValue
+
+  LexConversationLogsBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub
+      - '${ID}-lex-conversation-logs'
+      - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        Fn::If:
+        - CreateCMK
+        - ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !GetAtt CustomerManagedKey.Arn
+              SSEAlgorithm: 'aws:kms'
+            BucketKeyEnabled: true
+        - Ref: AWS::NoValue
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: Customer can enable access logging if desired
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: Customer can enable access logging if desired
+
+  LexConversationLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateCMK
+    Properties:
+      Bucket: !Ref LexConversationLogsBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Sid: DenyUnEncryptedObjectUploads
+          Effect: Deny
+          Principal: "*"
+          Action: s3:PutObject
+          # Resource: !GetAtt LexConversationLogsBucket.Arn
+          Resource: !Sub 'arn:aws:s3:::${LexConversationLogsBucket}/*'
+          Condition:
+            StringNotEquals:
+              s3:x-amz-server-side-encryption: aws:kms
+        
+  LexLogsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref "AWS::AccountId"
+      DatabaseInput:
+        Description: "Database for Lex logs"
+        LocationUri: "TestLocationUri"
+        Name: !Sub
+          - '${ID}-database'
+          - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+
+  GlueSecurityConfiguration:
+    Type: AWS::Glue::SecurityConfiguration
+    Condition: CreateCMK
+    Properties:
+      Name: !Sub
+        - '${ID}-glue-security-config'
+        - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      EncryptionConfiguration:
+        S3Encryptions:
+          - KmsKeyArn: !GetAtt CustomerManagedKey.Arn
+            S3EncryptionMode: SSE-KMS
+
+  LexConversationLogsCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Role: !GetAtt GlueCrawlerRole.Arn
+      Name: !Sub
+       - '${ID}-lex-logs-crawler'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      Description: Crawler for Lex conversation logs
+      DatabaseName: !Ref LexLogsDatabase
+      Targets:
+        S3Targets:
+          - Path: !Ref LexConversationLogsBucket
+      Configuration: "{ \"Version\": 1.0, \"Grouping\": { \"TableGroupingPolicy\": \"CombineCompatibleSchemas\" }, \"CrawlerOutput\": { \"Tables\": { \"AddOrUpdateBehavior\": \"MergeNewColumns\" }, \"Partitions\": { \"AddOrUpdateBehavior\": \"InheritFromTable\" } } }"
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      CrawlerSecurityConfiguration: !If [CreateCMK, !Ref GlueSecurityConfiguration, !Ref "AWS::NoValue"]
+      Schedule:
+        # this cron expression will run every 5 minutes
+        ScheduleExpression: "cron(0/5 * * * ? *)"
+
+  Logsubscription:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      LogGroupName: !Ref pLogGroupName
+      DestinationArn: !GetAtt KinesisDeliveryStream.Arn
+      FilterPattern: " "
+      RoleArn: !GetAtt CloudwatchLogsToKinesisRole.Arn
+      FilterName: !Sub
+       - '${ID}-subscription-filter'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+
+  ErrorAlarmSNSTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateErrorAlarms
+    Properties:
+      TopicName: !Sub
+       - '${ID}-lex-data-pipeline-errors'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      KmsMasterKeyId: alias/aws/sns
+
+  SNSEmailSubscriptionErrors:
+    Type: AWS::SNS::Subscription
+    Condition: SubscribeEmailAddressErrors
+    Properties:
+      TopicArn: !Ref ErrorAlarmSNSTopic
+      Endpoint: !Ref pErrorAlarmEmailSubscription
+      Protocol: email
+
+  FirehoseLambdaErrorMetricFilter: 
+    Type: AWS::Logs::MetricFilter
+    Condition: CreateErrorAlarms
+    DependsOn: ErrorAlarmSNSTopic
+    Properties: 
+      FilterName: !Sub
+        - '${ID}-firehose-lambda-errors'
+        - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      FilterPattern: "ERROR"
+      LogGroupName: !Ref FirehoseTransformLambdaLogGroup
+      MetricTransformations: 
+        - MetricValue: "1"
+          Unit: Count
+          MetricNamespace: !Sub
+           - '${ID}-lex-data-pipeline'
+           - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+          MetricName: !Sub
+           - '${ID}-firehose-lambda-errors'
+           - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+
+  FireHoseLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateErrorAlarms
+    Properties:
+      AlarmName: !Sub
+       - '${ID}-firehose-lambda-errors'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      AlarmDescription: Alarm on ERROR log entries in Firehose Lambda logs
+      AlarmActions: 
+       - !Ref ErrorAlarmSNSTopic
+      MetricName: !Sub
+       - '${ID}-firehose-lambda-errors'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      Namespace: !Sub
+       - '${ID}-lex-data-pipeline'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      Statistic: SampleCount
+      TreatMissingData: notBreaching
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '0'
+      ComparisonOperator: GreaterThanThreshold
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Alarm name preferred for convenience
+
+  WarningAlarmSNSTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateWarningAlarms
+    Properties:
+      TopicName: !Sub
+       - '${ID}-lex-data-pipeline-warnings'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      KmsMasterKeyId: alias/aws/sns
+
+  SNSEmailSubscriptionWarnings:
+    Type: AWS::SNS::Subscription
+    Condition: SubscribeEmailAddressWarnings
+    Properties:
+      TopicArn: !Ref WarningAlarmSNSTopic
+      Endpoint: !Ref pWarningAlarmEmailSubscription
+      Protocol: email
+
+  FirehoseLambdaWarningMetricFilter: 
+    Type: AWS::Logs::MetricFilter
+    Condition: CreateWarningAlarms
+    DependsOn: WarningAlarmSNSTopic
+    Properties: 
+      FilterName: !Sub
+        - '${ID}-firehose-lambda-warnings'
+        - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      FilterPattern: "WARNING"
+      LogGroupName: !Ref FirehoseTransformLambdaLogGroup
+      MetricTransformations: 
+        - MetricValue: "1"
+          Unit: Count
+          MetricNamespace: !Sub
+           - '${ID}-lex-data-pipeline'
+           - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+          MetricName: !Sub
+           - '${ID}-firehose-lambda-warnings'
+           - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+
+  FireHoseLambdaWarningAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateWarningAlarms
+    Properties:
+      AlarmName: !Sub
+       - '${ID}-firehose-lambda-warnings'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      AlarmDescription: Alarm on WARNING log entries in Firehose Lambda logs
+      AlarmActions: 
+       - !Ref WarningAlarmSNSTopic
+      MetricName: !Sub
+       - '${ID}-firehose-lambda-warnings'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      Namespace: !Sub
+       - '${ID}-lex-data-pipeline'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      Statistic: SampleCount
+      TreatMissingData: notBreaching
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '0'
+      ComparisonOperator: GreaterThanThreshold
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Alarm name preferred for convenience
+
+Outputs:
+  CloudwatchLogsToKinesisRoleArn:
+    Description: CloudWatch Logs - Kinesis::PutRecords
+    Value: !GetAtt CloudwatchLogsToKinesisRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudwatchLogsToKinesisRoleArn"
+  KinesisDeliveyStreamRoleArn:
+    Description: Kinesis - S3::PutObjects and Lambda::InvokeFunction
+    Value: !GetAtt KinesisDeliveryStreamRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-KinesisDeliveryStreamRoleArn"
+  LambdaTransformRoleArn:
+    Description: Lambda - CloudWatch Logs::PutLogEvents
+    Value: !GetAtt LambdaTransformRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaTransformRoleArn"
+  GlueCrawlerRoleArn:
+    Description: Glue - AWSGlueServiceRole and S3::GetObject
+    Value: !GetAtt GlueCrawlerRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-GlueCrawlerRoleArn"
+  ErrorAlarmSNSTopicArn:
+    Condition: CreateErrorAlarms
+    Description: SNS topic for subscribing to data pipeline errors
+    Value: !Ref ErrorAlarmSNSTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-ErrorAlarmSNSTopicArn"
+  WarningAlarmSNSTopicArn:
+    Condition: CreateWarningAlarms
+    Description: SNS topic for subscribing to data pipeline warnings
+    Value: !Ref WarningAlarmSNSTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-WarningAlarmSNSTopicArn"

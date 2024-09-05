@@ -1,0 +1,17 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "LexInvokeBot",
+            "Effect": "Allow",
+            "Action": [
+                "lex:GetSession",
+                "lex:PutSession",
+                "lex:RecognizeText",
+                "lex:RecognizeUtterance",
+                "lex:StartConversation"
+            ],
+            "Resource": "arn:aws:lex:*:*:bot-alias/*/*"
+        }
+    ]
+}

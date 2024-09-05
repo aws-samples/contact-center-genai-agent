@@ -1,0 +1,1934 @@
+# 
+#  Example stack to demonstrate updating an address with Lex
+#
+
+Description: >
+  Sample Lex bot and Lambda function to demonstrate automated address lookup and validation
+
+Parameters:
+  pBotName:
+    Description: This will create a new Lex bot
+    Type: String
+    Default: hotel-bot
+
+  pConversationTurns:
+    Description: You can adjust the number of turns in the conversation that are retained for context for retrieval and generation
+    Type: String
+    Default: 4
+
+  pLogGroupARN:
+    Description: The ARN for an existing CloudWatch Logs log group where your Lex conversation logs will be stored (optional)
+    Type: String
+
+  pProvisionedConcurrency:
+    Description: >
+      Configuring provisioned concurrency can reduce AWS Lambda cold starts. See: https://docs.aws.amazon.com/lambda/latest/dg/provisioned-concurrency.html
+    Type: String
+    Default: 0
+
+  pUseCMK:
+    Description: Create a customer-managed KMS key for encrypting CloudWatch Logs log groups.
+    Type: String
+    Default: 'no'
+    AllowedValues:
+      - 'no'
+      - 'yes'
+
+  pConnectInstanceARN:
+    Type: String
+    Description: >
+      ARN of the existing Connect Instance. To find your instance ARN: https://docs.aws.amazon.com/connect/latest/adminguide/find-instance-arn.html
+
+  pContactFlowName:
+    Type: String
+    Description: >
+      Enter a name for a new Connect contact flow. Please ensure no contact flow with the same name already exists.
+    Default: hotel-bot-sample-flow
+
+  pKBID:
+    Type: String
+    Description: Enter the ID of the existing Knowledge Base
+
+  pKBS3Bucket:
+    Type: String
+    Description: Enter the name of the existing S3 bucket (optional - for filtering based on S3 folders)
+
+  pSQSQueueName:
+    Type: String
+    Description: >
+      Enter the name (not the ARN) of the existing SQS Queue for asynchronous hallucination detection 
+
+  pSQSQueueKeyArn:
+    Type: String
+    Description: >
+      If the SQS Queue is encrypted with a KMS customer managed key, provide the KMS key ARN
+
+  pS3BlogArtifactsBucket:
+    Type: String
+    Description: Temporary - will not be needed when blog post is published
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: Amazon Lex Bot
+      Parameters:
+      - pBotName
+      - pConversationTurns
+      - pLogGroupARN
+      - pProvisionedConcurrency
+      - pUseCMK
+    - Label:
+        default: Amazon Connect Integration (optional)
+      Parameters:
+      - pConnectInstanceARN
+      - pContactFlowName
+    - Label:
+        default: Bedrock Knowledge Base
+      Parameters:
+      - pKBID
+      - pKBS3Bucket
+    - Label:
+        default: SQS Queue for Asynchronous Hallucination Detection (optional)
+      Parameters:
+      - pSQSQueueName
+      - pSQSQueueKeyArn
+    - Label:
+        default: Blog Post Artifacts
+      Parameters:
+      - pS3BlogArtifactsBucket
+    ParameterLabels:
+      pBotName:
+        default: Lex bot name
+      pConversationTurns:
+        default: Number of conversation turns for context
+      pLogGroupARN:
+        default: Conversation logs group ARN
+      pProvisionedConcurrency:
+        default: Number of AWS Lambda provisioned concurrency units (use 0 for no provisioned concurrency)
+      pUseCMK:
+        default: Create a Customer-Managed Key?
+      pConnectInstanceARN:
+        default: Connect instance ARN
+      pContactFlowName:
+        default: Connect contact flow name
+      pKBID:
+        default: Knowledge Base ID
+      pKBS3Bucket:
+        default: Knowledge Base S3 bucket
+      pSQSQueueName:
+        default: SQS Queue Name
+      pSQSQueueKeyArn:
+        default: SQS Queue Encryption Key ARN
+      pS3BlogArtifactsBucket:
+        default: Name of the S3 bucket with blog artifacts
+
+Mappings:
+  S3Path:
+    BotHandlerSource:
+      Name: 'lex/hotel-bot-handler.zip'
+    BotHandlerLayer:
+      Name: 'lex/bedrock-boto3-lambda-layer.zip'
+    ContactFlowImport:
+      Name: 'connect/import-connect-contact-flow.zip'
+  BucketName:
+    eu-west-1:
+      Name: 'lex-usecases-eu-west-1'
+    ap-northeast-1:
+      Name: 'lex-usecases-ap-northeast-1'
+    ap-southeast-1:
+      Name: 'lex-usecases-ap-southeast-1'
+    ap-southeast-2:
+      Name: 'lex-usecases-ap-southeast-2'
+    eu-central-1:
+      Name: 'lex-usecases-eu-central-1'
+    us-east-1:
+      Name: 'lex-usecases-us-east-1'
+    us-east-2:
+      Name: 'lex-usecases-us-east-2'
+    us-west-2:
+      Name: 'lex-usecases-us-west-2'
+
+Conditions:
+  EnableConversationLogsText: !Not [!Equals [!Ref pLogGroupARN, '']]
+  EnableProvisionedConcurrency: !Not [!Equals [!Ref pProvisionedConcurrency, '0']]
+  CreateCMK: !Equals [!Ref pUseCMK, 'yes']
+  IsSQSQueueEncrypted: !Not [!Equals [!Ref pSQSQueueKeyArn, '']]
+
+Resources:
+  #
+  # IAM Role used by the Lex service to make runtime calls
+  #
+  LexServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lexv2.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - 'Fn::If':
+          - EnableConversationLogsText
+          -
+              PolicyName: LexCloudWatchPolicy
+              PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                  - Effect: Allow
+                    Action:
+                      - logs:CreateLogStream
+                      - logs:PutLogEvents
+                    Resource: !Ref pLogGroupARN
+          - !Ref "AWS::NoValue"
+        - PolicyName: LexRuntimeRolePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "polly:SynthesizeSpeech"
+                  - "comprehend:DetectSentiment"
+                Resource: "*"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: SynthesizeSpeech and DetectSentiment do not use resource specifications
+
+  #
+  # Lex bot fullfilment function/handler
+  #
+  BotHandler:
+    Type: AWS::Lambda::Function
+    DependsOn: BotHandlerLogGroup
+    Properties:
+      FunctionName: !Sub '${pBotName}-handler'
+      Code:
+        # S3Bucket: !FindInMap [BucketName, !Ref "AWS::Region", 'Name']
+        S3Bucket: !Ref pS3BlogArtifactsBucket
+        S3Key: !FindInMap [S3Path, 'BotHandlerSource', 'Name']
+      Handler: handler.lambda_handler
+      Role: !GetAtt BotHandlerRole.Arn
+      Layers:
+      - Ref: Boto3Layer
+      Runtime: python3.11
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          KB_ALFA: !Ref pKBID
+          S3_BUCKET_ALFA: !Sub ${pKBS3Bucket}
+          SQS_QUEUE_URL: !Sub https://sqs.${AWS::Region}.amazonaws.com/${AWS::AccountId}/${pSQSQueueName}
+          CONVERSATION_TURNS: !Ref pConversationTurns
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: Customer can use VPC if desired
+          - id: W92
+            reason: One-time use Lambda for CloudFormation custom resource, no reserved concurrency needed
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: Customer can use VPC if desired
+          - id: CKV_AWS_116
+            comment: Customer can add DLQ and handling if desired
+          - id: CKV_AWS_115
+            comment: Provisioned concurrency configured in Lambda alias; customer can set reserved concurrency if desired
+          - id: CKV_AWS_173
+            comment: No sensitive data in environment variables
+
+  BotHandlerVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref BotHandler
+      Description: First published version
+
+  BotHandlerAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref BotHandler
+      FunctionVersion: !GetAtt BotHandlerVersion.Version
+      Name: qa-test-alias
+      ProvisionedConcurrencyConfig:
+        'Fn::If':
+          - EnableProvisionedConcurrency
+          -
+            ProvisionedConcurrentExecutions: !Ref pProvisionedConcurrency
+          - !Ref "AWS::NoValue"
+
+  BotHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    # DependsOn: CustomerManagedKey
+    Properties:
+      RetentionInDays: 30
+      KmsKeyId: !If [CreateCMK, !GetAtt CustomerManagedKey.Arn, !Ref "AWS::NoValue"]
+      LogGroupName: !Sub '/aws/lambda/${pBotName}-handler'
+
+  BotHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: write-cloudwatch-logs
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: WriteCloudWatchLogs
+            Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:CreateLogGroup
+            - logs:PutLogEvents
+            Resource:
+                !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${pBotName}-handler:*
+      - PolicyName: invoke-bedrock-model
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: InvokeBedrockModel
+            Effect: Allow
+            Action:
+            - bedrock:InvokeModel
+            Resource:
+                !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/*
+      - PolicyName: invoke-bedrock-retrieve
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: InvokeBedrockRetrieve
+            Effect: Allow
+            Action:
+            - bedrock:GetKnowledgeBase
+            - bedrock:Retrieve
+            Resource:
+                !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${pKBID}
+      - PolicyName: send-sqs-message
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: SendSQSMessage
+            Effect: Allow
+            Action:
+            - sqs:SendMessage
+            Resource: 
+                !Sub arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${pSQSQueueName}
+      - 'Fn::If':
+        - IsSQSQueueEncrypted
+        -
+            PolicyName: encrypt-sqs-message
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Sid: EncryptSQSMessage
+                  Effect: Allow
+                  Action:
+                    - kms:Encrypt
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                  Resource: !Ref pSQSQueueKeyArn
+        - !Ref "AWS::NoValue"
+
+  Boto3Layer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub
+       - 'boto3-layer-${ID}'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      CompatibleRuntimes:
+      - python3.8
+      - python3.9
+      - python3.10
+      - python3.11
+      Content:
+        # S3Bucket: !FindInMap [BucketName, !Ref "AWS::Region", 'Name']
+        S3Bucket: !Ref pS3BlogArtifactsBucket
+        S3Key: !FindInMap [S3Path, 'BotHandlerLayer', 'Name']
+      Description: boto3/botocore >= 1.34.98
+      LicenseInfo: Apache-2.0
+
+  #
+  # Lex bot definition
+  #
+  LexBot:
+    Type: AWS::Lex::Bot
+    Properties:
+      Name: !Ref pBotName
+      RoleArn: !GetAtt LexServiceRole.Arn
+      DataPrivacy:
+        ChildDirected: false
+      IdleSessionTTLInSeconds: 1800
+      Description: "Sample Lex bot for the Contact Center RAG solution"
+
+      AutoBuildBotLocales: true
+
+      TestBotAliasSettings:
+        Description: Draft version for development
+        BotAliasLocaleSettings:
+          - BotAliasLocaleSetting:
+              CodeHookSpecification: 
+                LambdaCodeHook:
+                  CodeHookInterfaceVersion: "1.0"
+                  LambdaArn: !GetAtt BotHandler.Arn
+              Enabled: true
+            LocaleId: "en_US"
+        ConversationLogSettings:
+          'Fn::If':
+            - EnableConversationLogsText
+            -
+              TextLogSettings:
+                - Destination:
+                    CloudWatch:
+                      CloudWatchLogGroupArn: !Ref pLogGroupARN
+                      LogPrefix: !Ref pBotName
+                  Enabled: true
+            - !Ref "AWS::NoValue"
+        SentimentAnalysisSettings:
+          DetectSentiment: true
+
+      BotLocales:
+        - LocaleId: "en_US"
+          Description: "US English language locale"
+          NluConfidenceThreshold: 0.20
+          VoiceSettings:
+            VoiceId: "Matthew"
+
+          SlotTypes:
+            - Name: "Toggle"
+              Description: "A slot type for enabling/disabling features."
+              SlotTypeValues:
+                - SampleValue:
+                    Value: "on"
+                  Synonyms:
+                    - Value: enabled
+                    - Value: enable
+                    - Value: use
+                    - Value: turn on
+                - SampleValue:
+                    Value: "off"
+                  Synonyms:
+                    - Value: disabled
+                    - Value: disable
+                    - Value: don't use
+                    - Value: do not use
+                    - Value: turn off
+              ValueSelectionSetting:
+                ResolutionStrategy: TOP_RESOLUTION
+
+            - Name: "KnowledgeBase"
+              Description: "List of Knowledge Bases"
+              SlotTypeValues:
+                - SampleValue:
+                    Value: Alfa
+                  Synonyms:
+                    - Value: Alpha
+                - SampleValue:
+                    Value: Bravo
+                - SampleValue:
+                    Value: Charlie
+                - SampleValue:
+                    Value: Delta
+                - SampleValue:
+                    Value: Echo
+                - SampleValue:
+                    Value: Foxtrot
+              ValueSelectionSetting:
+                ResolutionStrategy: TOP_RESOLUTION
+
+            - Name: "LLMType"
+              Description: "List of large language models (LLMs) supported."
+
+              SlotTypeValues:
+                - SampleValue:
+                    Value: Jurassic 2 Mid
+                  Synonyms:
+                    - Value: ai21 mid
+                    - Value: a. i. twenty one mid
+                    - Value: ai21 jurassic mid
+                    - Value: a. i. twenty one jurassic mid
+                    - Value: ai21 jurassic 2 mid
+                    - Value: a. i. twenty one jurassic two mid
+                    - Value: jurassic mid
+                    - Value: jurassic two mid
+                - SampleValue:
+                    Value: Jurassic 2 Ultra
+                  Synonyms:
+                    - Value: ai21 ultra
+                    - Value: a. i. twenty one ultra
+                    - Value: ai21 jurassic ultra
+                    - Value: a. i. twenty one jurassic ultra
+                    - Value: ai21 jurassic 2 ultra
+                    - Value: a. i. twenty one jurassic two ultra
+                    - Value: jurassic ultra
+                    - Value: jurassic two ultra
+                - SampleValue:
+                    Value: Jamba Instruct
+                  Synonyms:
+                    - Value: ai21 jamba
+                    - Value: a. i. jamba
+                    - Value: ai21 jamba instruct
+                    - Value: a. i. twenty jamba instruct
+                    - Value: jamba
+
+                - SampleValue:
+                    Value: Titan Text G1 Lite
+                  Synonyms:
+                    - Value: titan lite
+                    - Value: titan light
+                    - Value: titan text lite
+                    - Value: titan text light
+                    - Value: titan text g1 light
+                    - Value: titan text g. one lite
+                    - Value: titan text g. one light
+                    - Value: amazon titan lite
+                    - Value: amazon titan light
+                    - Value: amazon titan text lite
+                    - Value: amazon titan text light
+                    - Value: amazon titan text g1 lite
+                    - Value: amazon titan text g1 light
+                    - Value: amazon titan text g. one lite
+                    - Value: amazon titan text g. one light
+                - SampleValue:
+                    Value: Titan Text G1 Express
+                  Synonyms:
+                    - Value: titan express
+                    - Value: titan text express
+                    - Value: titan text g. one express
+                    - Value: amazon titan express
+                    - Value: amazon titan text express
+                    - Value: amazon titan text g1 express
+                    - Value: amazon titan text g. one express
+                - SampleValue:
+                    Value: Titan Text G1 Premier
+                  Synonyms:
+                    - Value: titan premier
+                    - Value: titan text premier
+                    - Value: titan text g. one premier
+                    - Value: amazon titan premier
+                    - Value: amazon titan text premier
+                    - Value: amazon titan text g1 premier
+                    - Value: amazon titan text g. one premier
+
+                - SampleValue:
+                    Value: Claude V1 Instant
+                  Synonyms:
+                    - Value: claude instant
+                    - Value: claude v. one instant
+                    - Value: claude v. one dot two instant
+                    - Value: claude v1.2 instant
+                    - Value: anthropic claude instant
+                    - Value: anthropic claude v. one instant
+                    - Value: anthropic claude v. one dot two instant
+                    - Value: anthropic claude v1 instant
+                    - Value: anthropic claude v1.2 instant
+                - SampleValue:
+                    Value: Claude V2
+                  Synonyms:
+                    - Value: claude v. two
+                    - Value: claude 2
+                    - Value: claude two
+                    - Value: anthropic claude v2
+                    - Value: anthropic claude v. two
+                    - Value: anthropic claude 2
+                    - Value: anthropic claude two
+                - SampleValue:
+                    Value: Claude V2.1
+                  Synonyms:
+                    - Value: anthropic claude V2.1
+                    - Value: claude two dot one
+                    - Value: anthropic claude two dot one
+                    - Value: claude v. two dot one
+                    - Value: anthropic claude v. two dot one
+                - SampleValue:
+                    Value: Claude V3 Haiku
+                  Synonyms:
+                    - Value: haiku
+                    - Value: haiku 3
+                    - Value: haiku three
+                    - Value: claude 3
+                    - Value: claude v. three
+                    - Value: claude haiku
+                    - Value: claude 3 haiku
+                    - Value: claude v. three haiku
+                    - Value: anthropic haiku
+                    - Value: anthropic haiku 3
+                    - Value: anthropic haiku three
+                    - Value: anthropic claude v3 haiku
+                    - Value: anthropic claude 3
+                    - Value: anthropic claude v. three
+                    - Value: anthropic claude haiku
+                    - Value: anthropic claude 3 haiku
+                    - Value: anthropic claude v. three haiku
+                - SampleValue:
+                    Value: Claude V3 Sonnet
+                  Synonyms:
+                    - Value: sonnet
+                    - Value: sonnet 3
+                    - Value: sonnet three
+                    - Value: claude sonnet
+                    - Value: claude 3 sonnet
+                    - Value: claude v. three sonnet
+                    - Value: anthropic sonnet
+                    - Value: anthropic sonnet 3
+                    - Value: anthropic sonnet three
+                    - Value: anthropic claude v3 sonnet
+                    - Value: anthropic claude sonnet
+                    - Value: anthropic claude 3 sonnet
+                    - Value: anthropic claude v. three sonnet
+                - SampleValue:
+                    Value: Claude V3.5 Sonnet
+                  Synonyms:
+                    - Value: sonnet 3.5
+                    - Value: sonnet three dot five
+                    - Value: sonnet v. three dot five
+                    - Value: claude sonnet 3.5
+                    - Value: claude sonnet three dot five
+                    - Value: claude sonnet v. three dot five 
+                    - Value: anthropic sonnet 3.5
+                    - Value: anthropic sonnet three dot five
+                    - Value: anthropic sonnet v. three dot five
+                    - Value: anthropic claude sonnet 3.5
+                    - Value: anthropic claude sonnet three dot five
+                    - Value: anthropic claude sonnet v. three dot five 
+                - SampleValue:
+                    Value: Claude V3 Opus
+                  Synonyms:
+                    - Value: opus
+                    - Value: opus 3
+                    - Value: opus three
+                    - Value: claude opus
+                    - Value: claude 3 opus
+                    - Value: claude v. three opus
+                    - Value: anthropic opus
+                    - Value: anthropic opus 3
+                    - Value: anthropic opus three
+                    - Value: anthropic claude v3 opus
+                    - Value: anthropic claude opus
+                    - Value: anthropic claude 3 opus
+                    - Value: anthropic claude v. three opus
+
+                - SampleValue:
+                    Value: Cohere Command Light
+                  Synonyms:
+                    - Value: cohere lite
+                    - Value: cohere command lite
+                    - Value: cohere light
+                    - Value: co hear light
+                    - Value: co hear command light
+                - SampleValue:
+                    Value: Cohere Command
+                  Synonyms:
+                    - Value: co hear command
+                - SampleValue:
+                    Value: Cohere Command R
+                  Synonyms:
+                    - Value: cohere r.
+                    - Value: co hear r.
+                    - Value: co hear command r.
+                - SampleValue:
+                    Value: Cohere Command R Plus
+                  Synonyms:
+                    - Value: cohere r. plus
+                    - Value: co hear r. plus
+                    - Value: co hear command r. plus
+
+                - SampleValue:
+                    Value: Llama 3 8B Instruct
+                  Synonyms:
+                    - Value: llama 3 8B
+                    - Value: llama three eight b.
+                    - Value: llama three eight b. instruct
+                - SampleValue:
+                    Value: Llama 3 70B Instruct
+                  Synonyms:
+                    - Value: llama 3 70B
+                    - Value: llama three seventy b.
+                    - Value: llama three seventy b. instruct
+
+                - SampleValue:
+                    Value: Mistral 7B
+                  Synonyms:
+                    - Value: mistral 7 b.
+                    - Value: mistral seven B.
+                - SampleValue:
+                    Value: Mixtral 8x7B
+                  Synonyms:
+                    - Value: mixtral
+                    - Value: mixtral eight by seven B.
+                    - Value: mixtral eight by seven
+                - SampleValue:
+                    Value: Mistral Small
+                - SampleValue:
+                    Value: Mistral Large
+
+              ValueSelectionSetting:
+                ResolutionStrategy: TOP_RESOLUTION
+                AdvancedRecognitionSetting:
+                  AudioRecognitionStrategy: UseSlotValuesAsCustomVocabulary
+
+            - Name: "Brand"
+              Description: "Hotel brands for the Example Corp Hospitality Group example"
+              SlotTypeValues:
+                - SampleValue:
+                    Value: Example Corp Seaside Resorts
+                  Synonyms:
+                    - Value: Seaside Resorts
+                    - Value: Seaside Resort
+                    - Value: Seaside
+                    - Value: Resort
+                - SampleValue:
+                    Value: Example Corp Luxury Suites
+                  Synonyms:
+                    - Value: Luxury Suites
+                    - Value: Luxury
+                    - Value: Suites
+                - SampleValue:
+                    Value: Example Corp Waypoint Inns
+                  Synonyms:
+                    - Value: Waypoint Inns
+                    - Value: Waypoint Inn
+                    - Value: Waypoint
+                    - Value: Inns
+                - SampleValue:
+                    Value: Example Corp Family Getaways
+                  Synonyms:
+                    - Value: Family Getaways
+                    - Value: Family Getaway
+                    - Value: Getaways
+                - SampleValue:
+                    Value: Example Corp Party Times
+                  Synonyms:
+                    - Value: Party Times
+                    - Value: Party Time
+                    - Value: Party
+                - SampleValue:
+                    Value: Any
+                  Synonyms:
+                    - Value: others
+                    - Value: other ones
+                    - Value: other hotels
+                    - Value: your other hotels
+                    - Value: other brands
+                    - Value: your other brands
+                    - Value: other locations
+                    - Value: your other locations
+                    - Value: other properties
+                    - Value: your other properties
+                    - Value: any of them
+                    - Value: any hotel
+                    - Value: any other hotel
+                    - Value: any of the hotels
+                    - Value: any of your hotels
+                    - Value: any brand
+                    - Value: any other brand
+                    - Value: any of the brands
+                    - Value: any of your brands
+                    - Value: any location
+                    - Value: any other location
+                    - Value: any of the locations
+                    - Value: any of your locations
+                    - Value: any property
+                    - Value: any other property
+                    - Value: any of the properties
+                    - Value: any of your properties
+              ValueSelectionSetting:
+                ResolutionStrategy: TOP_RESOLUTION
+
+          Intents:
+            - Name: "Help"
+              Description: "User asks for help about what the bot can do"
+              SampleUtterances:
+                - Utterance: "help"
+                - Utterance: "what can I say"
+                - Utterance: "what are my options"
+                - Utterance: "tell me the options again"
+                - Utterance: "options"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "SpeakToAgent"
+              Description: "User would like to speak to an agent"
+              SampleUtterances:
+                - Utterance: "agent"
+                - Utterance: "speak to an agent"
+                - Utterance: "talk to a customer service representative"
+                - Utterance: "C.S.R."
+                - Utterance: "representative"
+                - Utterance: "can I talk to real person"
+                - Utterance: "can I speak with a human"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "Goodbye"
+              Description: "User is done with the conversation"
+              SampleUtterances:
+                - Utterance: "no thanks"
+                - Utterance: "no thank you"
+                - Utterance: "no I am good thanks"
+                - Utterance: "I'm all set"
+                - Utterance: "I'm done"
+                - Utterance: "that's it"
+                - Utterance: "goodbye"
+                - Utterance: "bye now"
+                - Utterance: "bye"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "SelectKnowledgeBase"
+              Description: "Choose which Knowledge Base to use"
+              SampleUtterances:
+                - Utterance: "kb {knowledgeBase}"
+                - Utterance: "k. b. {knowledgeBase}"
+                - Utterance: "knowledge base {knowledgeBase}"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: knowledgeBase
+              Slots:
+                - Name: "knowledgeBase"
+                  Description: "Choose which Knowledge Base to use."
+                  SlotTypeName: "KnowledgeBase"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: Knowledge base prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+                    SampleUtterances:
+                      - Utterance: "it's {knowledgeBase}"
+                      - Utterance: "it is {knowledgeBase}"
+                      - Utterance: "yeah sure its {knowledgeBase}"
+                      - Utterance: "yes {knowledgeBase}"
+                      - Utterance: "ok umm {knowledgeBase}"
+                      - Utterance: "ahh {knowledgeBase}"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "SelectLLM"
+              Description: "Choose which Large Language Model to use"
+              SampleUtterances:
+                - Utterance: "LLM {ragLLM}"
+                - Utterance: "L. L. M. {ragLLM}"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: ragLLM
+              Slots:
+                - Name: "ragLLM"
+                  Description: "Choose which Large Language Model to use"
+                  SlotTypeName: "LLMType"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: LLM prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+                    SampleUtterances:
+                      - Utterance: "it's {ragLLM}"
+                      - Utterance: "it is {ragLLM}"
+                      - Utterance: "yeah sure its {ragLLM}"
+                      - Utterance: "yes {ragLLM}"
+                      - Utterance: "ok umm {ragLLM}"
+                      - Utterance: "ahh {ragLLM}"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "ToggleLLMContext"
+              Description: Toggle the "use context" indicator on/off for intents that use an LLM
+              SampleUtterances:
+                - Utterance: "context {contextSwitch}"
+                - Utterance: "{contextSwitch} context"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: contextSwitch
+              Slots:
+                - Name: "contextSwitch"
+                  Description: "Toggle the context setting on/off"
+                  SlotTypeName: "Toggle"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: Context switch prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "ToggleLLMGuardrails"
+              Description: Toggle the "use guardrails" indicator on/off for intents that use an LLM
+              SampleUtterances:
+                - Utterance: "guardrails {guardrailsSwitch}"
+                - Utterance: "{guardrailsSwitch} guardrails"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: guardrailsSwitch
+              Slots:
+                - Name: "guardrailsSwitch"
+                  Description: "Toggle the guardrails setting on/off"
+                  SlotTypeName: "Toggle"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: Guardrails switch prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "CorporateOverview"
+              Description: "Provide a general overview, including history, mission, and the portfolio of hotel brands"
+              SampleUtterances:
+                - Utterance: "what can you tell me about example corp hospitality group"
+                - Utterance: "give me an overview of example corp hospitality group"
+                - Utterance: "i want to learn about the history of example corp hospitality group"
+                - Utterance: "what is example corp hospitality group's mission"
+                - Utterance: "tell me about example corp hospitality group's core values"
+                - Utterance: "what hotel brands does example corp hospitality group own"
+                - Utterance: "describe example corp hospitality group's portfolio of hotels"
+                - Utterance: "i need information on example corp hospitality group's different hotel chains"
+                - Utterance: "can you explain the various hotel brands under example corp hospitality group"
+                - Utterance: "what are the hotel options within example corp hospitality group"
+                - Utterance: "tell me about {brand}"
+                - Utterance: "give me details on {brand}"
+                - Utterance: "i'd like an overview of {brand}"
+                - Utterance: "what can you share about {brand}"
+                - Utterance: "describe {brand} for me"
+                - Utterance: "fill me in on the details of {brand}"
+                - Utterance: "i want to know more about {brand}"
+                - Utterance: "provide information on {brand}"
+                - Utterance: "tell me the history of {brand}"
+                - Utterance: "what is {brand} all about"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: brand
+              Slots:
+                - Name: "brand"
+                  Description: "Hotel brand"
+                  SlotTypeName: "Brand"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: Hotel brand prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+                    SampleUtterances:
+                      - Utterance: "yes {brand}"
+                      - Utterance: "yeah for {brand}"
+                      - Utterance: "the {brand}"
+                      - Utterance: "ok umm {brand}"
+                      - Utterance: "ahh {brand}"
+                      - Utterance: "oh the {brand}"
+                      - Utterance: "{brand} I guess"
+                      - Utterance: "{brand} I think"
+                      - Utterance: "the ah {brand}"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "BrandPortfolio"
+              Description: "Cover the different hotel brands under the Example Corp Hospitality Group umbrella"
+              SampleUtterances:
+                - Utterance: "What hotel brands does Example Corp Hospitality Group have"
+                - Utterance: "Tell me about the different hotels under Example Corp Hospitality Group"
+                - Utterance: "I want to know more about {brand}"
+                - Utterance: "Can you describe {brand} for me"
+                - Utterance: "What kind of experience can I expect at {brand}"
+                - Utterance: "Give me an overview of {brand}"
+                - Utterance: "I'm interested in learning about {brand}"
+                - Utterance: "What amenities and services are offered at {brand}"
+                - Utterance: "Tell me about the {brand} hotels"
+                - Utterance: "Explain the concept behind {brand}"
+                - Utterance: "What makes {brand} unique"
+                - Utterance: "I'd like information on {brand}"
+                - Utterance: "Describe the {brand} brand for me"
+                - Utterance: "What can you tell me about Example Corp's luxury hotels"
+                - Utterance: "I need details on Example Corp's family-friendly resorts"
+                - Utterance: "Fill me in on Example Corp's party hotels"
+                - Utterance: "Give me the scoop on Example Corp's seaside resorts"
+                - Utterance: "What are Example Corp's extended-stay hotel options"
+                - Utterance: "I'm curious about Example Corp's different hotel categories"
+                - Utterance: "Provide an overview of Example Corp's hotel portfolio"
+                - Utterance: "Enlighten me on Example Corp's various hotel brands"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: brand
+              Slots:
+                - Name: "brand"
+                  Description: "Hotel brand"
+                  SlotTypeName: "Brand"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: Hotel brand prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+                    SampleUtterances:
+                      - Utterance: "yes {brand}"
+                      - Utterance: "yeah for {brand}"
+                      - Utterance: "the {brand}"
+                      - Utterance: "ok umm {brand}"
+                      - Utterance: "ahh {brand}"
+                      - Utterance: "oh the {brand}"
+                      - Utterance: "{brand} I guess"
+                      - Utterance: "{brand} I think"
+                      - Utterance: "the ah {brand}"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "CorporateSustainability"
+              Description: "Handle inquiries about sustainability and eco-friendly practices"
+              SampleUtterances:
+                - Utterance: "what are your eco-friendly initiatives"
+                - Utterance: "tell me about your sustainability efforts"
+                - Utterance: "how does Example Corp Hospitality Group promote sustainability"
+                - Utterance: "what is Example Corp Hospitality Group doing to be more environmentally friendly"
+                - Utterance: "are your hotels energy efficient"
+                - Utterance: "do you have any green practices at {brand}"
+                - Utterance: "what kind of recycling programs do you have"
+                - Utterance: "is {brand} committed to reducing waste"
+                - Utterance: "are your hotels built with sustainable materials"
+                - Utterance: "do you use renewable energy sources"
+                - Utterance: "how are you minimizing your environmental impact"
+                - Utterance: "what water conservation measures are in place at {brand}"
+                - Utterance: "tell me about your corporate social responsibility program"
+                - Utterance: "are your hotels designed with eco-efficiency in mind"
+                - Utterance: "do you have electric vehicle charging stations"
+                - Utterance: "what is your sustainability program"
+                - Utterance: "how do you give back to local communities"
+                - Utterance: "are your hotels LEED certified"
+                - Utterance: "what is your carbon footprint reduction strategy"
+                - Utterance: "do you have any eco-friendly amenities"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: brand
+              Slots:
+                - Name: "brand"
+                  Description: "Hotel brand"
+                  SlotTypeName: "Brand"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: Hotel brand prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+                    SampleUtterances:
+                      - Utterance: "yes {brand}"
+                      - Utterance: "yeah for {brand}"
+                      - Utterance: "the {brand}"
+                      - Utterance: "ok umm {brand}"
+                      - Utterance: "ahh {brand}"
+                      - Utterance: "oh the {brand}"
+                      - Utterance: "{brand} I guess"
+                      - Utterance: "{brand} I think"
+                      - Utterance: "the ah {brand}"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "CorporateLoyaltyProgram"
+              Description: "Provide information about loyalty programs"
+              SampleUtterances:
+                - Utterance: "what loyalty program do you offer"
+                - Utterance: "tell me about your rewards program"
+                - Utterance: "is there a loyalty program for {brand}"
+                - Utterance: "how can I join your rewards club"
+                - Utterance: "what are the benefits of your loyalty program"
+                - Utterance: "explain the example rewards program"
+                - Utterance: "how do I earn points with your loyalty program"
+                - Utterance: "can you describe the example rewards loyalty program"
+                - Utterance: "details on your rewards program please"
+                - Utterance: "loyalty program information"
+                - Utterance: "what perks come with your rewards program"
+                - Utterance: "how does the {brand} loyalty program work"
+                - Utterance: "benefits of joining your rewards club"
+                - Utterance: "do you have a frequent guest program"
+                - Utterance: "tell me about rewards for loyal customers"
+                - Utterance: "what are the loyalty tiers for example rewards"
+                - Utterance: "how to redeem points with your loyalty program"
+                - Utterance: "loyalty program overview"
+                - Utterance: "can you explain your rewards program"
+                - Utterance: "is there a frequent stay program"
+                - Utterance: "details on your loyalty program"
+                - Utterance: "loyalty program for frequent travelers"
+                - Utterance: "what are the elite status levels"
+                - Utterance: "how to achieve elite status with example rewards"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: brand
+              Slots:
+                - Name: "brand"
+                  Description: "Hotel brand"
+                  SlotTypeName: "Brand"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: Hotel brand prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+                    SampleUtterances:
+                      - Utterance: "yes {brand}"
+                      - Utterance: "yeah for {brand}"
+                      - Utterance: "the {brand}"
+                      - Utterance: "ok umm {brand}"
+                      - Utterance: "ahh {brand}"
+                      - Utterance: "oh the {brand}"
+                      - Utterance: "{brand} I guess"
+                      - Utterance: "{brand} I think"
+                      - Utterance: "the ah {brand}"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "Welcome"
+              Description: "General greetings and introductions to the bot"
+              SampleUtterances:
+                - Utterance: "hi"
+                - Utterance: "hello"
+                - Utterance: "hey there"
+                - Utterance: "greetings"
+                - Utterance: "good morning"
+                - Utterance: "good afternoon"
+                - Utterance: "good evening"
+                - Utterance: "what is this"
+                - Utterance: "what can you tell me"
+                - Utterance: "what kind of information do you provide"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "Locations"
+              Description: "Provide information about the locations of the hotel brands"
+              SampleUtterances:
+                - Utterance: "where are {brand} hotels located"
+                - Utterance: "what cities have {brand} hotels"
+                - Utterance: "tell me about the locations of {brand}"
+                - Utterance: "in what regions can I find {brand} hotels"
+                - Utterance: "list the areas with {brand} properties"
+                - Utterance: "where are {brand} resorts situated"
+                - Utterance: "give me details on {brand} geographic presence"
+                - Utterance: "what are some of the places {brand} has hotels"
+                - Utterance: "locations of {brand} hotels"
+                - Utterance: "cities with {brand} hotels"
+                - Utterance: "areas with {brand} properties"
+                - Utterance: "regions for {brand} resorts"
+                - Utterance: "where can I stay at {brand}"
+                - Utterance: "destinations for {brand} hotels"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: brand
+              Slots:
+                - Name: "brand"
+                  Description: "Hotel brand"
+                  SlotTypeName: "Brand"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: Hotel brand prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+                    SampleUtterances:
+                      - Utterance: "yes {brand}"
+                      - Utterance: "yeah for {brand}"
+                      - Utterance: "the {brand}"
+                      - Utterance: "ok umm {brand}"
+                      - Utterance: "ahh {brand}"
+                      - Utterance: "oh the {brand}"
+                      - Utterance: "{brand} I guess"
+                      - Utterance: "{brand} I think"
+                      - Utterance: "the ah {brand}"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "Accommodations"
+              Description: "Details about the different types of accommodations offered"
+              SampleUtterances:
+                - Utterance: "what types of rooms do you offer"
+                - Utterance: "tell me about your room options"
+                - Utterance: "describe the different room types available"
+                - Utterance: "i need information on your suite accommodations"
+                - Utterance: "can you provide details on your suite options"
+                - Utterance: "what kind of suites do you have"
+                - Utterance: "are there any accessible rooms"
+                - Utterance: "do you have rooms for guests with disabilities"
+                - Utterance: "accessibility room details please"
+                - Utterance: "accessible room amenities"
+                - Utterance: "i'm looking for information on your accessible accommodations"
+                - Utterance: "what are the features of your accessible rooms"
+                - Utterance: "i want to know about the room types at {brand}"
+                - Utterance: "what kind of suites does {brand} offer"
+                - Utterance: "suite options and amenities for {brand}"
+                - Utterance: "accessible room details for {brand}"
+                - Utterance: "accommodation information for {brand}"
+                - Utterance: "room descriptions for {brand} hotels"
+                - Utterance: "details about the different rooms at {brand}"
+                - Utterance: "suite amenities and features at {brand}"
+                - Utterance: "accessible room options at {brand}"
+                - Utterance: "accessibility accommodations for {brand}"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: brand
+              Slots:
+                - Name: "brand"
+                  Description: "Hotel brand"
+                  SlotTypeName: "Brand"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: Hotel brand prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+                    SampleUtterances:
+                      - Utterance: "yes {brand}"
+                      - Utterance: "yeah for {brand}"
+                      - Utterance: "the {brand}"
+                      - Utterance: "ok umm {brand}"
+                      - Utterance: "ahh {brand}"
+                      - Utterance: "oh the {brand}"
+                      - Utterance: "{brand} I guess"
+                      - Utterance: "{brand} I think"
+                      - Utterance: "the ah {brand}"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "Amenities"
+              Description: "Provide information about the various amenities available"
+              SampleUtterances:
+                - Utterance: "what kind of pools do you have at {brand}"
+                - Utterance: "tell me about the fitness facilities at {brand}"
+                - Utterance: "are there any restaurants at {brand}"
+                - Utterance: "what entertainment options are available at {brand}"
+                - Utterance: "can you describe the amenities offered at {brand}"
+                - Utterance: "i want to know about the pools and fitness centers at {brand}"
+                - Utterance: "do you have dining options at {brand}"
+                - Utterance: "what kind of entertainment facilities do you offer"
+                - Utterance: "is there a spa at {brand}"
+                - Utterance: "are there any kid-friendly amenities at {brand}"
+                - Utterance: "tell me about the outdoor activities available at {brand}"
+                - Utterance: "what amenities are included for guests staying at {brand}"
+                - Utterance: "describe the pool area at {brand}"
+                - Utterance: "are there any bars or lounges at {brand}"
+                - Utterance: "what kind of dining experiences can i expect at {brand}"
+                - Utterance: "do you have any recreational facilities at {brand}"
+                - Utterance: "i'm looking for information on the amenities at {brand}"
+                - Utterance: "what amenities do you offer for families at {brand}"
+                - Utterance: "are there any nightlife or party amenities at {brand}"
+                - Utterance: "can you tell me about the fitness center at {brand}"
+                - Utterance: "what kind of pools and water features are available"
+                - Utterance: "describe the dining options at your hotels"
+                - Utterance: "what entertainment or recreational amenities do you have"
+                - Utterance: "are there any spa facilities or wellness amenities"
+                - Utterance: "do you have any amenities for business travelers"
+                - Utterance: "tell me about the amenities for kids and families"
+                - Utterance: "what kind of outdoor spaces or activities are offered"
+                - Utterance: "are there any amenities for pets or pet-friendly areas"
+                - Utterance: "can you provide details on the pool and beach amenities"
+                - Utterance: "what kind of nightlife or party amenities are available"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: brand
+              Slots:
+                - Name: "brand"
+                  Description: "Hotel brand"
+                  SlotTypeName: "Brand"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: Hotel brand prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+                    SampleUtterances:
+                      - Utterance: "yes {brand}"
+                      - Utterance: "yeah for {brand}"
+                      - Utterance: "the {brand}"
+                      - Utterance: "ok umm {brand}"
+                      - Utterance: "ahh {brand}"
+                      - Utterance: "oh the {brand}"
+                      - Utterance: "{brand} I guess"
+                      - Utterance: "{brand} I think"
+                      - Utterance: "the ah {brand}"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "Services"
+              Description: "Handle inquiries about the services offered"
+              SampleUtterances:
+                - Utterance: "what kind of concierge services do you offer"
+                - Utterance: "tell me about your concierge services"
+                - Utterance: "do you have a concierge service"
+                - Utterance: "can you tell me about the concierge services at {brand}"
+                - Utterance: "what transportation options are available at {brand}"
+                - Utterance: "how can I get around from {brand}"
+                - Utterance: "do you offer transportation services"
+                - Utterance: "what event planning services do you provide"
+                - Utterance: "can you help me plan an event at {brand}"
+                - Utterance: "do you have event planning packages"
+                - Utterance: "what kind of services do you provide for weddings"
+                - Utterance: "do you have wedding planning services"
+                - Utterance: "can you help me plan a corporate event"
+                - Utterance: "what services do you offer for business travelers"
+                - Utterance: "do you have any special amenities for business guests"
+                - Utterance: "what kind of meeting facilities do you have"
+                - Utterance: "can you tell me about your business centers"
+                - Utterance: "do you offer any special services for families"
+                - Utterance: "what services are available for kids"
+                - Utterance: "do you have any activities for children"
+                - Utterance: "do you provide babysitting services"
+                - Utterance: "what kind of services do you offer for pets"
+                - Utterance: "are there any pet-friendly amenities"
+                - Utterance: "do you have designated pet areas"
+                - Utterance: "can you tell me about your private butler service"
+                - Utterance: "what kind of butler services are available"
+                - Utterance: "do you offer private butler service"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: brand
+              Slots:
+                - Name: "brand"
+                  Description: "Hotel brand"
+                  SlotTypeName: "Brand"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: Hotel brand prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+                    SampleUtterances:
+                      - Utterance: "yes {brand}"
+                      - Utterance: "yeah for {brand}"
+                      - Utterance: "the {brand}"
+                      - Utterance: "ok umm {brand}"
+                      - Utterance: "ahh {brand}"
+                      - Utterance: "oh the {brand}"
+                      - Utterance: "{brand} I guess"
+                      - Utterance: "{brand} I think"
+                      - Utterance: "the ah {brand}"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "Policies"
+              Description: "Inquiries about hotel policies and regulations"
+              SampleUtterances:
+                - Utterance: "what are the check-in and check-out times"
+                - Utterance: "do you allow pets at {brand}"
+                - Utterance: "is smoking permitted in the rooms"
+                - Utterance: "what is your cancellation policy"
+                - Utterance: "can i bring my dog to {brand}"
+                - Utterance: "are there any restrictions on pets"
+                - Utterance: "what time is check-out"
+                - Utterance: "when can i check into {brand}"
+                - Utterance: "do you have a smoking policy"
+                - Utterance: "tell me about your pet policy"
+                - Utterance: "what are the rules regarding pets"
+                - Utterance: "is there a fee for canceling my reservation"
+                - Utterance: "are service animals allowed at {brand}"
+                - Utterance: "what happens if i need to cancel my stay"
+                - Utterance: "do you charge for cancellations"
+                - Utterance: "are there any policies about noise levels"
+                - Utterance: "what is the policy on smoking"
+                - Utterance: "can i have a late check-out"
+                - Utterance: "is there a charge for late check-out"
+                - Utterance: "are there quiet hours at {brand}"
+                - Utterance: "do you allow pets in the rooms"
+                - Utterance: "what are the rules for pets"
+                - Utterance: "is there a fee for pets"
+                - Utterance: "what time do i need to check out"
+                - Utterance: "when is the latest i can check out"
+                - Utterance: "are there any policies about parties or gatherings"
+                - Utterance: "what is your policy on smoking"
+                - Utterance: "can i smoke in my room at {brand}"
+                - Utterance: "do you have designated smoking areas"
+                - Utterance: "is vaping allowed in the rooms"
+                - Utterance: "what are the rules regarding smoking"
+                - Utterance: "are there any restrictions on smoking"
+                - Utterance: "do you charge a cleaning fee for smoking"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: brand
+              Slots:
+                - Name: "brand"
+                  Description: "Hotel brand"
+                  SlotTypeName: "Brand"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: Hotel brand prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+                    SampleUtterances:
+                      - Utterance: "yes {brand}"
+                      - Utterance: "yeah for {brand}"
+                      - Utterance: "the {brand}"
+                      - Utterance: "ok umm {brand}"
+                      - Utterance: "ahh {brand}"
+                      - Utterance: "oh the {brand}"
+                      - Utterance: "{brand} I guess"
+                      - Utterance: "{brand} I think"
+                      - Utterance: "the ah {brand}"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "Parking"
+              Description: "Inquiries about parking accommodations and electric vehicle charging stations"
+              SampleUtterances:
+                - Utterance: "what are the parking options at {brand}"
+                - Utterance: "tell me about parking at {brand}"
+                - Utterance: "is valet parking available at {brand}"
+                - Utterance: "do you have self-parking at {brand}"
+                - Utterance: "where can I park at {brand}"
+                - Utterance: "are there electric vehicle charging stations at {brand}"
+                - Utterance: "how much does parking cost at {brand}"
+                - Utterance: "is there a fee for valet parking at {brand}"
+                - Utterance: "can I charge my electric car at {brand}"
+                - Utterance: "what are the rates for ev charging at {brand}"
+                - Utterance: "parking accommodations at {brand}"
+                - Utterance: "details on parking at {brand}"
+                - Utterance: "information about valet parking"
+                - Utterance: "self-parking rates"
+                - Utterance: "electric vehicle charging options"
+                - Utterance: "do you offer complimentary parking"
+                - Utterance: "parking facilities"
+                - Utterance: "parking lot details"
+                - Utterance: "valet service information"
+                - Utterance: "ev charging station availability"
+                - Utterance: "overnight parking options"
+                - Utterance: "accessible parking spaces"
+                - Utterance: "oversized vehicle parking"
+                - Utterance: "parking for rvs and trailers"
+                - Utterance: "parking garage details"
+                - Utterance: "covered parking availability"
+                - Utterance: "secure parking options"
+                - Utterance: "parking payment methods"
+                - Utterance: "parking validation"
+                - Utterance: "parking discounts or packages"
+                - Utterance: "parking for guests with disabilities"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: brand
+              Slots:
+                - Name: "brand"
+                  Description: "Hotel brand"
+                  SlotTypeName: "Brand"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: Hotel brand prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+                    SampleUtterances:
+                      - Utterance: "yes {brand}"
+                      - Utterance: "yeah for {brand}"
+                      - Utterance: "the {brand}"
+                      - Utterance: "ok umm {brand}"
+                      - Utterance: "ahh {brand}"
+                      - Utterance: "oh the {brand}"
+                      - Utterance: "{brand} I guess"
+                      - Utterance: "{brand} I think"
+                      - Utterance: "the ah {brand}"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "Booking"
+              Description: "Inquiries related to making reservations or booking stays at the hotels"
+              SampleUtterances:
+                - Utterance: "how do i book a room at {brand}"
+                - Utterance: "can you help me reserve a suite for {brand}"
+                - Utterance: "i want to make a reservation at {brand}"
+                - Utterance: "how can i book accommodations for {brand}"
+                - Utterance: "what are the rates for {brand}"
+                - Utterance: "tell me about booking options for {brand}"
+                - Utterance: "i need to book a stay at {brand}"
+                - Utterance: "is there availability for {brand}"
+                - Utterance: "can you check rates for {brand}"
+                - Utterance: "booking information for {brand}"
+                - Utterance: "details on making a reservation"
+                - Utterance: "room rates and availability"
+                - Utterance: "reservation process"
+                - Utterance: "booking accommodations"
+                - Utterance: "securing a room"
+                - Utterance: "checking rates and availability"
+                - Utterance: "making a hotel reservation"
+                - Utterance: "booking details"
+                - Utterance: "reservation inquiry"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: brand
+              Slots:
+                - Name: "brand"
+                  Description: "Hotel brand"
+                  SlotTypeName: "Brand"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: Hotel brand prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+                    SampleUtterances:
+                      - Utterance: "yes {brand}"
+                      - Utterance: "yeah for {brand}"
+                      - Utterance: "the {brand}"
+                      - Utterance: "ok umm {brand}"
+                      - Utterance: "ahh {brand}"
+                      - Utterance: "oh the {brand}"
+                      - Utterance: "{brand} I guess"
+                      - Utterance: "{brand} I think"
+                      - Utterance: "the ah {brand}"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "SwitchBrand"
+              Description: "Switch the discussion to another hotel brand (or no specific brand)"
+              SampleUtterances:
+                - Utterance: "what about {brand}"
+                - Utterance: "how about at {brand}"
+                - Utterance: "what about for {brand}"
+                - Utterance: "and at {brand}"
+                - Utterance: "{brand}"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: brand
+              Slots:
+                - Name: "brand"
+                  Description: "Hotel brand"
+                  SlotTypeName: "Brand"
+                  MultipleValuesSetting:
+                    AllowMultipleValues: false
+                  ValueElicitationSetting:
+                    SlotConstraint: "Optional"
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: Hotel brand prompt
+                      MaxRetries: 2
+                      AllowInterrupt: true
+                    SampleUtterances:
+                      - Utterance: "yes {brand}"
+                      - Utterance: "yeah for {brand}"
+                      - Utterance: "the {brand}"
+                      - Utterance: "ok umm {brand}"
+                      - Utterance: "ahh {brand}"
+                      - Utterance: "oh the {brand}"
+                      - Utterance: "{brand} I guess"
+                      - Utterance: "{brand} I think"
+                      - Utterance: "the ah {brand}"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+
+            - Name: "FallbackIntent"
+              Description: "Default intent when no other intent matches"
+              ParentIntentSignature: "AMAZON.FallbackIntent"
+              DialogCodeHook:
+                Enabled: true
+              FulfillmentCodeHook:
+                Enabled: true
+ 
+  #
+  # Bot version and alias
+  #
+  BotVersion:
+    Type: AWS::Lex::BotVersion
+    Properties:
+      BotId: !Ref LexBot
+      BotVersionLocaleSpecification:
+        - LocaleId: en_US
+          BotVersionLocaleDetails:
+            SourceBotVersion: DRAFT
+      Description: Initial version
+ 
+  BotAlias:
+    Type: AWS::Lex::BotAlias
+    Properties:
+      BotId: !Ref LexBot
+      BotAliasName: qa-test-alias   # this is the name of the *bot* alias
+      Description: Stable alias for team testing
+      BotAliasLocaleSettings:
+        - LocaleId: en_US
+          BotAliasLocaleSetting:
+            Enabled: true
+            CodeHookSpecification: 
+              LambdaCodeHook:
+                CodeHookInterfaceVersion: "1.0"
+                LambdaArn: !Sub 
+                 - '${LAMBDA}:qa-test-alias'      # this is the name of the *lambda* alias
+                 - LAMBDA: !GetAtt BotHandler.Arn
+
+      BotVersion: !GetAtt BotVersion.BotVersion
+      ConversationLogSettings:
+        'Fn::If':
+          - EnableConversationLogsText
+          -
+            TextLogSettings:
+              - Destination:
+                  CloudWatch:
+                    CloudWatchLogGroupArn: !Ref pLogGroupARN
+                    LogPrefix: !Ref pBotName
+                Enabled: true
+          - !Ref "AWS::NoValue"
+      SentimentAnalysisSettings:
+        DetectSentiment: true
+
+  #
+  # Resource-based policies to allow Lex to invoke the Lambda handler function
+  #
+  BotAliasPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Sub 
+       - '${LAMBDA}:qa-test-alias'
+       - LAMBDA: !Ref BotHandler
+      Action: lambda:InvokeFunction
+      Principal: lexv2.amazonaws.com
+      # the "qa-test-alias" Lex bot alias can access this Lambda alias
+      SourceArn: !GetAtt BotAlias.Arn   
+
+  BotAliasTestPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt BotHandler.Arn
+      Action: lambda:InvokeFunction
+      Principal: lexv2.amazonaws.com
+      # the "TestBotAlias" Lex bot alias can access the Lambda "$LATEST" version
+      SourceArn: !Sub arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/${LexBot}/TSTALIASID
+
+  #
+  # Optional KMS key
+  #
+  CustomerManagedKey:
+    Type: 'AWS::KMS::Key'
+    Condition: CreateCMK
+    Properties:
+      Description: Customer-managed key for CloudWatch logs 
+      Enabled: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      MultiRegion: 'true'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow use of the key - Lex BotHandler log group
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${pBotName}-handler
+          - Sid: Allow use of the key - Connect Import Function CloudWatch Logs group 
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${pBotName}-connect-import
+
+  CustomerManagedKeyAlias:
+    Type: 'AWS::KMS::Alias'
+    Condition: CreateCMK
+    Properties:
+      AliasName: !Sub
+       - 'alias/${ID}-rag-solution-key'
+       - ID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref "AWS::StackId"]]]]
+      TargetKeyId: !Ref CustomerManagedKey
+
+  #
+  # Custom resource to configure a contact flow in the Connect instance
+  #
+  ConnectImportFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: !Join [ "_", [ !Ref AWS::StackName, 'write-logs' ] ]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Sid: WriteCloudWatchLogs
+              Effect: Allow
+              Action:
+              - logs:CreateLogStream
+              - logs:CreateLogGroup
+              - logs:PutLogEvents
+              Resource:
+                  !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${pBotName}-connect-import:*
+
+        - PolicyName: !Join [ "_", [ !Ref AWS::StackName, 'connect-actions' ] ]
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'connect:ListContactFlows'
+                  - 'connect:DescribeContactFlow'
+                  - 'connect:CreateContactFlow'
+                  - 'connect:DeleteContactFlow'
+                  - 'connect:AssociateBot'
+                  - 'connect:DisassociateBot'
+                  - 'connect:AssociateLambdaFunction'
+                  - 'connect:DisassociateLambdaFunction'
+                Resource: !Sub ${pConnectInstanceARN}*
+        - PolicyName: !Join [ "_", [ !Ref AWS::StackName, 'get-bot-alias' ] ]
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lex:ListBotAliases
+                  - lex:UpdateResourcePolicy
+                  - lex:DescribeResourcePolicy
+                  - lex:CreateResourcePolicy
+                  - lex:DescribeBotAlias
+                Resource: 
+                - !GetAtt BotAlias.Arn
+                - !Sub arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/${LexBot}/TSTALIASID
+
+  ConnectImportFunction:
+    Type: AWS::Lambda::Function
+    # DependsOn: CustomerManagedKey
+    Properties:
+      FunctionName: !Sub '${pBotName}-connect-import'
+      Code:
+        # S3Bucket: !FindInMap [BucketName, !Ref "AWS::Region", 'Name']
+        S3Bucket: !Ref pS3BlogArtifactsBucket
+        S3Key: !FindInMap [S3Path, 'ContactFlowImport', 'Name']
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt
+        - ConnectImportFunctionRole
+        - Arn
+      Runtime: python3.11
+      MemorySize: 128
+      Timeout: 30
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: Customer can use VPC if desired
+          - id: W92
+            reason: One-time use Lambda for CloudFormation custom resource, no reserved concurrency needed
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: Customer can use VPC if desired
+          - id: CKV_AWS_116
+            comment: One-time use Lambda for CloudFormation custom resource, no DLQ needed
+          - id: CKV_AWS_115
+            comment: One-time use Lambda for CloudFormation custom resource, no reserved concurrency needed
+
+  ConnectImportLogGroup:
+    Type: AWS::Logs::LogGroup
+    # DependsOn: CustomerManagedKey
+    Properties:
+      RetentionInDays: 30
+      KmsKeyId: !If [CreateCMK, !GetAtt CustomerManagedKey.Arn, !Ref "AWS::NoValue"]
+      LogGroupName: !Sub '/aws/lambda/${pBotName}-connect-import'
+
+  InvokeConnectImportFunction:
+    Type: Custom::InvokeConnectImportFunction
+    Version: '1.0'
+    Properties:
+      ServiceToken: !GetAtt ConnectImportFunction.Arn
+      ContactName: !Ref pContactFlowName
+      ConnectInstanceArn: !Ref pConnectInstanceARN
+      BotName: !Ref pBotName
+      BotAliasArn: !Sub arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/${LexBot}/TSTALIASID
+      BotName2: !Ref pBotName
+      BotAliasArn2: !GetAtt BotAlias.Arn
+
+Outputs:
+  BotId:
+    Value: !Ref LexBot
+    Description: Lex bot ID
+    Export:
+      Name: !Sub "${AWS::StackName}-BotId"
+  BotArn:
+    Value: !GetAtt LexBot.Arn
+    Description: Lex bot ARN
+    Export:
+      Name: !Sub "${AWS::StackName}-BotArn"
+  BotVersion:
+    Value: !GetAtt BotVersion.BotVersion
+    Description: Lex bot version
+    Export:
+      Name: !Sub "${AWS::StackName}-BotVersion"
+  BotAliasId:
+    Value: !GetAtt BotAlias.BotAliasId
+    Description: Lex bot alias ID
+    Export:
+      Name: !Sub "${AWS::StackName}-BotAliasId"
+  BotAliasArn:
+    Value: !Sub arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/${LexBot}/TSTALIASID
+    Description: Lex bot alias ARN
+    Export:
+      Name: !Sub "${AWS::StackName}-BotAliasArn"
+  ConversationLogs:
+    Value: !Ref pLogGroupARN
+    Description: CloudWatch Logs log group for Lex conversartion logs
+    Export:
+      Name: !Sub "${AWS::StackName}-ConversationLogs"
+  PrimaryAliasIdentifier:
+    Value: !Ref BotAlias
+    Description: Primary alias ID
+    Export:
+      Name: !Sub "${AWS::StackName}-PrimaryAliasId"
+  PrimaryVersionIdentifier:
+    Value: !Ref BotVersion
+    Description: Primary alias version
+    Export:
+      Name: !Sub "${AWS::StackName}-PrimaryAliasVersion"
+  Connect:
+    Value: !GetAtt InvokeConnectImportFunction.ContactFlowDescription
+    Description: 'Amazon Connect Status'
+    Export:
+      Name: !Sub "${AWS::StackName}-ConnectStatus"
+

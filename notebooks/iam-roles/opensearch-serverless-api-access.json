@@ -1,0 +1,14 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "OpenSearchServerlessAPIAccess",
+            "Effect": "Allow",
+            "Action": [
+                "aoss:APIAccessAll",
+                "aoss:DashboardsAccessAll"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
