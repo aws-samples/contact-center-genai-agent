@@ -366,6 +366,6 @@ When you no longer need the solution deployed in your AWS account, you can simpl
 
 ## Contributors
 
-- [Brian Yost](https://phonetool.amazon.com/users/bryost), Principal Deep Learning Architect, AWS Generative AI Innovation Center
-- [Alvaro Sanchez Martin](https://phonetool.amazon.com/users/marzalv), Senior Solutions Architect, ISV
+- [Brian Yost](mailto:bryost@amazon.com), Principal Deep Learning Architect, AWS Generative AI Innovation Center
+- [Alvaro Sanchez Martin](mailto:marzalv@amazon.com), Senior Solutions Architect, ISV
 
