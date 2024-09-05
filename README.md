@@ -65,7 +65,7 @@ If you’ll be integrating with Amazon Connect, make sure you have an instance a
 ## Deploy the [AWS CloudFormation](https://aws.amazon.com/cloudformation) stacks
 
 
-### *Step 2: Deploy the Knowledge Base stack*
+### *Step 1: Deploy the Knowledge Base stack*
 
 You will need to start with the Knowledge Base stack first. Either via the AWS CLI or the AWS console, deploy the [infrastructure/bedrock-KB.yaml](./infrastructure/bedrock-KB.yaml) CloudFormation template. You will need to supply the following input parameters:
 
@@ -108,7 +108,7 @@ Select an LLM model, such as Anthropic Claude Haiku, and start asking questions!
     <img src=images/kb-test-example.png alt="kb" width="100%">
 </p>
 
-### *Step 3: Deploy the Hallucination Detection stack (optional)*
+### *Step 2: Deploy the Hallucination Detection stack (optional)*
 
 If want to use the optional asynchronous hallucination detection feature, deploy this stack.  Otherwise move on to the [next section](#step-4-deploy-the-rag-solution-stack).
 
@@ -133,7 +133,7 @@ Once the stack has been completed, you can review the resources it creates from 
 If you entered email addresses for the alarm notifications, you should receive email requests asking you to confirm the subscriptions. Confirm them to receive email notifications about any alarms that may occur.
 
 
-### *Step 4: Deploy the RAG Solution stack*
+### *Step 3: Deploy the RAG Solution stack*
 
 Next, deploy the [infrastructure/contact-center-RAG-solution.yaml](./infrastructure/contact-center-RAG-solution.yaml) CloudFormation template. 
 
@@ -204,7 +204,7 @@ If you're integrating with Amazon Connect, there will be a new contact flow in t
 To test using voice, just claim a phone number, associate it with this contact flow, and give it a call.
 
 
-### *Step 5: Deploy the Conversation Analytics stack (optional)*
+### *Step 4: Deploy the Conversation Analytics stack (optional)*
 
 To enable the Conversation Analytics component, first deploy the [infrastructure/lex-data-pipeline.yaml](./infrastructure/lex-data-pipeline.yaml) CloudFormation template. 
 
@@ -238,7 +238,7 @@ As Amazon Lex writes conversation log entries to CloudWatch Logs, they are picke
 
 On a scheduled basis (every 5 minutes), an [AWS Glue](https://aws.amazon.com/glue) crawler inspects any new data in the S3 bucket, and updates a data schema that is used by [Amazon Athena](https://aws.amazon.com/athena) to provide a SQL interface to the data. This allows tools like Amazon QuickSight to create near realtime dashboards, analytics, and visualizations of the data.
 
-### *Step 6: Set up the QuickSight dashboard (optional)*
+### *Step 5: Set up the QuickSight dashboard (optional)*
 
 _**Note: before you create the QuickSight dashboard, make sure to return to the Amazon Lex console and ask a few questions, in order to generate some data for the dashboard.  It will take about five minutes for the pipeline to process this new conversation logs data and make it available to QuickSight.**_
 
@@ -246,7 +246,7 @@ To set up dashboards and visualizations in QuickSight, go to QuickSight in the A
 
 ![alt text](<images/quicksight-config-icon.png>)
 
-Under "Security & permissions", choose the "Manage" button in the "QuickSight access to AWS services" section. Under the "Amazon S3" item, choose "Select S3 buckets".  Enable access to the S3 bucket created by the Conversation Analytics stack in Step 5 (it will have a name with a 12-character unique identifier prepended to "lex-conversation-logs"). You don't need to enable write permissions.
+Under "Security & permissions", choose the "Manage" button in the "QuickSight access to AWS services" section. Under the "Amazon S3" item, choose "Select S3 buckets".  Enable access to the S3 bucket created by the Conversation Analytics stack in Step 4 (it will have a name with a 12-character unique identifier prepended to "lex-conversation-logs"). You don't need to enable write permissions.
 
 Choose "Finish", and then choose "Save". 
 
@@ -278,7 +278,7 @@ When you are ready, choose the "PUBLISH & VISUALIZE" button at the top right in 
     <img src=images/quicksight-analysis-example.png alt="quicksight-analysis" width="100%">
 </p>
 
-### *Step 7: Automated testing notebooks (optional)*
+### *Step 6: Automated testing notebooks (optional)*
 
 To try the automated testing capability, you will need a SageMaker Jupyter notebook (or, you can run the notebooks locally in your IDE or other environment that supports Jupyter notebooks).
 
@@ -317,7 +317,7 @@ Once your notebook instance has started, choose "Open Jupyter" to open the noteb
 - [generate_ground_truths.ipynb](notebooks/generate_ground_truths.ipynb) - Given a set of questions, generate potential ground truth answers.
 - [test-runs](test/test-runs/) - _Note: this folder should contain Excel workbooks_
 
-Open the "**run_tests.ipynb**" notebook. In the first cell, you will need to replace the "bot_id" and "bot_alias_id" with the values for your Lex bot (you can find these in the "Output" tab in the RAG Solution stack you created in Step 4). Once you've updated these values, choose "Restart & Run All" from the "Kernel" menu.
+Open the "**run_tests.ipynb**" notebook. In the first cell, you will need to replace the "bot_id" and "bot_alias_id" with the values for your Lex bot (you can find these in the "Output" tab in the RAG Solution stack you created in Step 3). Once you've updated these values, choose "Restart & Run All" from the "Kernel" menu.
 
 If you are using a ml.m5.2xlarge instance type, it should take about a minute to run the 50 test cases in the [test-runs/test-cases-claude-haiku-2024-09-02.xlsx](test/test-runs/test-cases-claude-haiku-2024-09-02.xlsx) workbook. When complete, you should find a corresponding "test-results" workbook in the test-runs folder in your notebook.
 
