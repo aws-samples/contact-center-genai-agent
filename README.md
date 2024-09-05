@@ -5,13 +5,12 @@
 # Contents
 - [Overview](#overview)
 - [Deploy and test the solution](#deploy-and-test-the-solution)
-    - [Step 1: Stage the AWS CloudFormation stack artifacts](#step-1-stage-the-cloudformation-stack-artifacts)
-    - [Step 2: Deploy the Knowledge Base stack](#step-2-deploy-the-knowledge-base-stack)
-    - [Step 3: Deploy the Hallucination Detection stack _(optional)_](#step-3-deploy-the-hallucination-detection-stack-optional)
-    - [Step 4: Deploy the RAG Solution stack](#step-4-deploy-the-rag-solution-stack)
-    - [Step 5: Deploy the Conversation Analytics stack _(optional)_](#step-5-deploy-the-conversation-analytics-stack-optional)
-    - [Step 6: Set up the Amazon QuickSight dashboard _(optional)_](#step-6-set-up-the-quicksight-dashboard-optional)
-    - [Step 7: Automated testing _(optional)_](#step-7-automated-testing-optional)
+    - [Step 1: Deploy the Knowledge Base stack](#step-2-deploy-the-knowledge-base-stack)
+    - [Step 2: Deploy the Hallucination Detection stack _(optional)_](#step-3-deploy-the-hallucination-detection-stack-optional)
+    - [Step 3: Deploy the RAG Solution stack](#step-4-deploy-the-rag-solution-stack)
+    - [Step 4: Deploy the Conversation Analytics stack _(optional)_](#step-5-deploy-the-conversation-analytics-stack-optional)
+    - [Step 5: Set up the Amazon QuickSight dashboard _(optional)_](#step-6-set-up-the-quicksight-dashboard-optional)
+    - [Step 6: Automated testing _(optional)_](#step-7-automated-testing-optional)
 
 - [Clean up](#clean-up)
 - [Adapt the solution to your use case](#adapt-the-solution-to-your-use-case)
@@ -47,7 +46,7 @@ The following diagram illustrates the solution architecture. The [deployment ins
 Fork the repository, and clone it to a location of your choice.  For example:
 
 ```{bash}
-git clone git@ssh.gitlab.aws.dev:<your-username>/contact-center-genai-assistant.git
+git clone git@github.com:aws-samples/contact-center-genai-agent.git
 ```
 
 ## Prerequisites
@@ -66,25 +65,6 @@ If you’ll be integrating with Amazon Connect, make sure you have an instance a
 ## Deploy the [AWS CloudFormation](https://aws.amazon.com/cloudformation) stacks
 
 
-### *Step 1: Stage the CloudFormation stack artifacts*
-
-The Knowledge Base, Hallucination Detection, and RAG Solution stacks require [AWS Lambda](https://aws.amazon.com/lambda/) code to be staged in an S3 bucket. 
-
-Either using the [AWS Command Line Interface](https://aws.amazon.com/cli/) (CLI) or in the [AWS Management Console](https://aws.amazon.com/console/), create an S3 bucket, for example "blog-artifacts-(your-account-number)".
-
-You will need to build the distribution artifacts from source. To do this, open a terminal window in each of the subfolders in the [src](./src) folder, and execute the "publish.sh" script. Alternatively, there is a "publish-all.sh" script you can run in the [src](./src) folder which will run them all.  These publish.sh scripts create the Python zip files for the four Lambda functions (as well as Lambda layers where needed).  _Note: You will need to have [pip](https://pypi.org/project/pip/) installed to run these scripts._ 
-
-Then once the artifacts are created, upload them from the "dist" folder to the S3 bucket. You will need to upload four folders:
-
-- **connect**: support for the CloudFormation custom resource that adds a contact flow into your Amazon Connect instance
-
-- **hallucinations**: the Python code for the Lambda function that performs asynchronous hallucination detection
-
-- **lex**: the Python code for the Lambda function that serves as a fulfillment function for the sample [Amazon Lex](https://aws.amazon.com/lex) bot, as well as a Lambda layer with the latest boto3 APIs
-
-- **opensearch**: support for the CloudFormation custom resource that creates the index in the OpenSearch Serverless collection
-
-
 ### *Step 2: Deploy the Knowledge Base stack*
 
 You will need to start with the Knowledge Base stack first. Either via the AWS CLI or the AWS console, deploy the [infrastructure/bedrock-KB.yaml](./infrastructure/bedrock-KB.yaml) CloudFormation template. You will need to supply the following input parameters:
@@ -97,14 +77,13 @@ You will need to start with the Knowledge Base stack first. Either via the AWS C
 - For the maximum tokens per chunk entry, use **600** for the Titan embedding model. (If you are using the Cohere embedding model, use **512**). This represents about a full page of text.
 - For the percentage overlap, use **10** percent.
 - Leave the four entries for Index Details at their default values (index name, vector field name, metadata field name, and text field name).
-- For the Blog Post Artifacts entry, enter the name (not the URL or ARN) of the S3 bucket you created above (for example, "blog-artificts-(your-account-number)").
 
 Note that this CloudFormation stack can be used for any Bedrock Knowledge base instance you may need using S3 as a data source.
 
 Choose "Next", and on the **Configure stack options** page choose "Next" again.  On the **Review and create** page, acknowledge the IAM capabilities message and choose "Submit".  The stack will take about 5 minutes to deploy.
 
 ### Upload the sample content and test your knowledge base
-The demonstration sample for the solution includes an LLM-based "hotel-bot" that can answer questions about the imaginary hotel chain called "Example Corp Hospitality Group". You will need to load the content for this hotel chain into the S3 bucket that was specified for the Knowledge Base stack. *(Note: make sure to use the S3 bucket you created for your knowledge base content, and not the bucket where you staged the CloudFormation stack artifacts.)*
+The demonstration sample for the solution includes an LLM-based "hotel-bot" that can answer questions about the imaginary hotel chain called "Example Corp Hospitality Group". You will need to load the content for this hotel chain into the S3 bucket that was specified for the Knowledge Base stack. 
 
 Either via the AWS CLI or the AWS Management Console, upload the following folders from the [content](./content) section of this repo:
 
@@ -173,7 +152,6 @@ You will need to supply the following input parameters:
 - The name of the S3 bucket used by the Knowledge Base stack (also referenced in the "Outputs" tab).
 - If you created the Hallucination Detection stack, enter the SQS Queue Name.
 - If you opted for a KMS key for your Hallucination Detection stack, enter the KMS Key ARN.
-- For the Blog Post Artifacts entry, enter the name of the S3 bucket you created above (for example, "blog-artificts-(your-account-number)").
 
 Choose "Next", and on the **Configure stack options** page choose "Next" again.  On the **Review and create** page, acknowledge the IAM capabilities message and choose "Submit".  The stack will take about 5 minutes to deploy.
 
