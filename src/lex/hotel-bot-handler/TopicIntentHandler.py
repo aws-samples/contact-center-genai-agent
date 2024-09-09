@@ -123,7 +123,7 @@ def lambda_handler(event, context):
         
         # retrieve context to pass to the LLM based on selected brand, if any
         # note: max query length is 1000 characters for Bedrock KB
-        logger.warn(f'BEDROCK KB Query = {rolling_conversation[-500:]}')
+        logger.info(f'BEDROCK KB Query = {rolling_conversation[-500:]}')
         response = bedrock_kb.retrieve_context(query=rolling_conversation[-500:])
 
         retrieval_time = response.get('invocation_time')
@@ -148,7 +148,7 @@ def lambda_handler(event, context):
         if len(turns) > MAX_CONVERSATION_TURNS:
             turns.pop(0)
         sessionAttributes['conversation'] = json.dumps(turns)
-        logger.warn(f'END CONVERSATION = {json.dumps(turns, indent=4)}')
+        logger.debug(f'END CONVERSATION = {json.dumps(turns, indent=4)}')
         
         # capture session attributes for analytics
         sessionAttributes['knowledge_base'] = bedrock_kb.kb_id
