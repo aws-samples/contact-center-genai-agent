@@ -153,6 +153,8 @@ Conditions:
   EnableConversationLogsText: !Not [!Equals [!Ref pLogGroupARN, '']]
   EnableProvisionedConcurrency: !Not [!Equals [!Ref pProvisionedConcurrency, '0']]
   CreateCMK: !Equals [!Ref pUseCMK, 'yes']
+  ConnectIntegration: !Not [!Equals [!Ref pConnectInstanceARN, '']]
+  SQSQueueIntegration: !Not [!Equals [!Ref pSQSQueueName, '']]
   IsSQSQueueEncrypted: !Not [!Equals [!Ref pSQSQueueKeyArn, '']]
 
 Resources:
@@ -221,11 +223,20 @@ Resources:
       MemorySize: 128
       Timeout: 30
       Environment:
-        Variables:
-          KB_ALFA: !Ref pKBID
-          S3_BUCKET_ALFA: !Sub ${pKBS3Bucket}
-          SQS_QUEUE_URL: !Sub https://sqs.${AWS::Region}.amazonaws.com/${AWS::AccountId}/${pSQSQueueName}
-          CONVERSATION_TURNS: !Ref pConversationTurns
+        'Fn::If':
+          - SQSQueueIntegration
+          -
+              Variables:
+                KB_ALFA: !Ref pKBID
+                S3_BUCKET_ALFA: !Sub ${pKBS3Bucket}
+                CONVERSATION_TURNS: !Ref pConversationTurns
+                SQS_QUEUE_URL: !Sub https://sqs.${AWS::Region}.amazonaws.com/${AWS::AccountId}/${pSQSQueueName}
+          - 
+              Variables:
+                KB_ALFA: !Ref pKBID
+                S3_BUCKET_ALFA: !Sub ${pKBS3Bucket}
+                CONVERSATION_TURNS: !Ref pConversationTurns
+
     Metadata:
       cfn_nag:
         rules_to_suppress:
@@ -265,7 +276,6 @@ Resources:
 
   BotHandlerLogGroup:
     Type: AWS::Logs::LogGroup
-    # DependsOn: CustomerManagedKey
     Properties:
       RetentionInDays: 30
       KmsKeyId: !If [CreateCMK, !GetAtt CustomerManagedKey.Arn, !Ref "AWS::NoValue"]
@@ -315,16 +325,20 @@ Resources:
             - bedrock:Retrieve
             Resource:
                 !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${pKBID}
-      - PolicyName: send-sqs-message
-        PolicyDocument:
-          Version: '2012-10-17'
-          Statement:
-          - Sid: SendSQSMessage
-            Effect: Allow
-            Action:
-            - sqs:SendMessage
-            Resource: 
-                !Sub arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${pSQSQueueName}
+      - 'Fn::If':
+        - SQSQueueIntegration
+        -
+            PolicyName: send-sqs-message
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+              - Sid: SendSQSMessage
+                Effect: Allow
+                Action:
+                - sqs:SendMessage
+                Resource: 
+                    !Sub arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${pSQSQueueName}
+        - !Ref "AWS::NoValue"
       - 'Fn::If':
         - IsSQSQueueEncrypted
         -
@@ -1749,20 +1763,24 @@ Resources:
             Condition:
               ArnLike:
                 kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${pBotName}-handler
-          - Sid: Allow use of the key - Connect Import Function CloudWatch Logs group 
-            Effect: Allow
-            Principal:
-              Service: !Sub logs.${AWS::Region}.amazonaws.com
-            Action:
-              - kms:Encrypt*
-              - kms:Decrypt*
-              - kms:ReEncrypt*
-              - kms:GenerateDataKey*
-              - kms:Describe*
-            Resource: '*'
-            Condition:
-              ArnLike:
-                kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${pBotName}-connect-import
+          - 'Fn::If':
+            - ConnectIntegration
+            -
+                Sid: Allow use of the key - Connect Import Function CloudWatch Logs group 
+                Effect: Allow
+                Principal:
+                  Service: !Sub logs.${AWS::Region}.amazonaws.com
+                Action:
+                  - kms:Encrypt*
+                  - kms:Decrypt*
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:Describe*
+                Resource: '*'
+                Condition:
+                  ArnLike:
+                    kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${pBotName}-connect-import
+            - !Ref "AWS::NoValue"
 
   CustomerManagedKeyAlias:
     Type: 'AWS::KMS::Alias'
@@ -1778,6 +1796,7 @@ Resources:
   #
   ConnectImportFunctionRole:
     Type: 'AWS::IAM::Role'
+    Condition: ConnectIntegration
     Properties:
       AssumeRolePolicyDocument:
         Version: 2012-10-17
@@ -1835,7 +1854,7 @@ Resources:
 
   ConnectImportFunction:
     Type: AWS::Lambda::Function
-    # DependsOn: CustomerManagedKey
+    Condition: ConnectIntegration
     Properties:
       FunctionName: !Sub '${pBotName}-connect-import'
       Code:
@@ -1867,7 +1886,7 @@ Resources:
 
   ConnectImportLogGroup:
     Type: AWS::Logs::LogGroup
-    # DependsOn: CustomerManagedKey
+    Condition: ConnectIntegration
     Properties:
       RetentionInDays: 30
       KmsKeyId: !If [CreateCMK, !GetAtt CustomerManagedKey.Arn, !Ref "AWS::NoValue"]
@@ -1875,6 +1894,7 @@ Resources:
 
   InvokeConnectImportFunction:
     Type: Custom::InvokeConnectImportFunction
+    Condition: ConnectIntegration
     Version: '1.0'
     Properties:
       ServiceToken: !GetAtt ConnectImportFunction.Arn
@@ -1912,6 +1932,7 @@ Outputs:
     Export:
       Name: !Sub "${AWS::StackName}-BotAliasArn"
   ConversationLogs:
+    Condition: EnableConversationLogsText
     Value: !Ref pLogGroupARN
     Description: CloudWatch Logs log group for Lex conversartion logs
     Export:
@@ -1927,6 +1948,7 @@ Outputs:
     Export:
       Name: !Sub "${AWS::StackName}-PrimaryAliasVersion"
   Connect:
+    Condition: ConnectIntegration
     Value: !GetAtt InvokeConnectImportFunction.ContactFlowDescription
     Description: 'Amazon Connect Status'
     Export:
