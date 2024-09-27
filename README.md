@@ -1,4 +1,4 @@
-# Contact Center GenAI Assistant
+# Contact Center GenAI Agent
 
 **_An automated question answering solution for contact centers, optimized for both text and voice._** 
 
