@@ -1,3 +1,7 @@
+#
+# Create a data pipeline using Amazon Lex conversation logs to create a conversation analytics dashboarding capability
+#
+
 AWSTemplateFormatVersion: 2010-09-09
 
 Description: >
