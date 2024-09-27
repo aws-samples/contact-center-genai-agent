@@ -52,9 +52,9 @@ Parameters:
     Default: ''
     Description: Leave blank, or provide a single email address/distribution list to receive CloudWatch warning alarm notifications
 
-  pS3BlogArtifactsBucket:
+  pArtifactsBucket:
     Type: String
-    Description: Temporary - will not be needed when blog post is published
+    Description: The name (not the URL or ARN) of the S3 bucket where you staged the CloudFormation stack artifacts
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -72,9 +72,9 @@ Metadata:
       - pCloudWatchWarningAlarms
       - pWarningAlarmEmailSubscription
     - Label:
-        default: Blog Post Artifacts
+        default: CloudFormation Stack Artifacts
       Parameters:
-      - pS3BlogArtifactsBucket
+      - pArtifactsBucket
     ParameterLabels:
       pHallucinationDetectionLLM:
         default: Select an LLM
@@ -88,8 +88,8 @@ Metadata:
         default: Create CloudWatch WARNING alarms?
       pWarningAlarmEmailSubscription:
         default: Subscribe to CloudWatch WARNING alarms?
-      pS3BlogArtifactsBucket:
-        default: Name of the S3 bucket with blog artifacts
+      pArtifactsBucket:
+        default: Name of the S3 bucket with CloudFormation stack artifacts
 
 Mappings:
   S3Path:
@@ -221,7 +221,7 @@ Resources:
       MemorySize: 1024
       Code:
         # S3Bucket: !FindInMap [BucketName, !Ref "AWS::Region", 'Name']
-        S3Bucket: !Ref pS3BlogArtifactsBucket
+        S3Bucket: !Ref pArtifactsBucket
         S3Key: !FindInMap [S3Path, 'DetectionFunctionSource', 'Name']
       Environment:
         Variables:

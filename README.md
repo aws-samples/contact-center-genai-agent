@@ -97,7 +97,7 @@ You will need to start with the Knowledge Base stack first. Either via the AWS C
 - For the maximum tokens per chunk entry, use **600** for the Titan embedding model. (If you are using the Cohere embedding model, use **512**). This represents about a full page of text.
 - For the percentage overlap, use **10** percent.
 - Leave the four entries for Index Details at their default values (index name, vector field name, metadata field name, and text field name).
-- For the Blog Post Artifacts entry, enter the name (not the URL or ARN) of the S3 bucket you created above (for example, "blog-artifacts-(your-account-number)").
+- For the CloudFormation Stack Artifacts entry, enter the name of the S3 bucket (not the URL or ARN) you created above (for example, "blog-artificts-(your-account-number)").
 
 Note that this CloudFormation stack can be used for any Bedrock Knowledge base instance you may need using S3 as a data source.
 
@@ -146,6 +146,7 @@ Either via the AWS CLI or the AWS console, deploy the [infrastructure/detect-hal
     - WARNING alarms, for when the Lambda function actually detects a hallucination. 
 - Both alarm types are optional, but recommended. Choose **yes** to enable or **no** to disable the alarms.
 - For the alarms that you enable, you can specify an optional email address or distribution list to receive email notifications about the alarms.
+- For the CloudFormation Stack Artifacts entry, enter the name of the S3 bucket (not the URL or ARN) you created above (for example, "blog-artificts-(your-account-number)").
 
 Choose "Next", and on the **Configure stack options** page choose "Next" again.  On the **Review and create** page, acknowledge the IAM capabilities message and choose "Submit".  The stack will take about a minute or two to deploy.
 
@@ -173,7 +174,7 @@ You will need to supply the following input parameters:
 - The name of the S3 bucket used by the Knowledge Base stack (also referenced in the "Outputs" tab).
 - If you created the Hallucination Detection stack, enter the SQS Queue Name.
 - If you opted for a KMS key for your Hallucination Detection stack, enter the KMS Key ARN.
-- For the Blog Post Artifacts entry, enter the name of the S3 bucket you created above (for example, "blog-artifacts-(your-account-number)").
+- For the CloudFormation Stack Artifacts entry, enter the name of the S3 bucket (not the URL or ARN) you created above (for example, "blog-artificts-(your-account-number)").
 
 Choose "Next", and on the **Configure stack options** page choose "Next" again.  On the **Review and create** page, acknowledge the IAM capabilities message and choose "Submit".  The stack will take about 5 minutes to deploy.
 
