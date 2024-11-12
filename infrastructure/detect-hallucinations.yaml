@@ -5,7 +5,7 @@
 AWSTemplateFormatVersion: 2010-09-09
 
 Description: >
-  Creates a Lambda function, triggered by an SQS queue, to detect hallucinations in responses from an LLM-based RAG solution.
+  Creates a Lambda function, triggered by an SQS queue, to detect hallucinations in responses from an LLM-based RAG solution (uksb-firp0rmi6s) (tag: LLMHallucinations)
 
 Parameters:
   pHallucinationDetectionLLM:

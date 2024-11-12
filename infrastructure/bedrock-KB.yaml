@@ -3,7 +3,7 @@
 #
 
 Description: >
-  Create a Bedrock Knowledge Base and an OpenSearch Serverless collection
+  Create a Bedrock Knowledge Base and an OpenSearch Serverless collection (uksb-firp0rmi6s) (tag: KnowledgeBase)
 
 Parameters:
   pKnowledgeBaseBucketName:

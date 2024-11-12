@@ -3,7 +3,7 @@
 #
 
 Description: >
-  Sample Lex bot and Lambda function to demonstrate automated address lookup and validation
+  Contact Center GenAI Assistant RAG Solution (uksb-firp0rmi6s) (tag: RAG)
 
 Parameters:
   pBotName:
